@@ -1,4 +1,4 @@
-import { useSettings } from '../services/settings.js'
+import { detectClientOS, useSettings } from '../services/settings.js'
 import { en } from './en.js'
 import { zh } from './zh.js'
 
@@ -32,3 +32,13 @@ export const useTranslate = () => useSettings((state) => translators[state.local
 
 export const translate = (key: TranslationKey, params?: TranslationParams): string =>
   translators[useSettings.getState().locale](key, params)
+
+const clientOS = detectClientOS()
+
+/** 按当前操作系统返回原生文件管理器的展示文案 key（macOS 访达 / Windows 资源管理器 / Linux 文件管理器） */
+export const revealInFileManagerKey: TranslationKey =
+  clientOS === 'darwin'
+    ? 'workspaceRevealInFinder'
+    : clientOS === 'windows'
+      ? 'workspaceRevealInExplorer'
+      : 'workspaceRevealInFileManager'

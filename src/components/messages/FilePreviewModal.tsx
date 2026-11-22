@@ -1,6 +1,6 @@
 import clsx from 'clsx'
 import { useEffect, useState } from 'react'
-import { useTranslate } from '../../i18n/index.js'
+import { revealInFileManagerKey, useTranslate } from '../../i18n/index.js'
 import type { FilePreview } from '../../mygo.js'
 import {
   openWorkspacePath,
@@ -151,7 +151,7 @@ export const FilePreviewModal = ({
                 void revealWorkspaceInFinder(filePath)
               }}
             >
-              {t('workspaceRevealInFinder')}
+              {t(revealInFileManagerKey)}
             </button>
           </div>
         </div>

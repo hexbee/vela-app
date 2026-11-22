@@ -1,6 +1,6 @@
 import clsx from 'clsx'
 import { useEffect, useMemo, useState } from 'react'
-import { useTranslate } from '../../i18n/index.js'
+import { revealInFileManagerKey, useTranslate } from '../../i18n/index.js'
 import {
   IconChevronRightOutline14,
   IconEditOutline16,
@@ -245,7 +245,7 @@ export const Sider = ({ mobile = false }: { mobile?: boolean }) => {
                           options={[
                             {
                               key: 'reveal',
-                              label: t('workspaceRevealInFinder'),
+                              label: t(revealInFileManagerKey),
                               icon: <IconFolderOpenOutline14 />,
                               onSelect: () => void revealWorkspaceInFinder(workspace.path),
                             },

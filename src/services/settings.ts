@@ -9,7 +9,9 @@ export type Locale = 'zh-CN' | 'en-US'
 /** 主题偏好；默认跟随系统 */
 export type ThemePreference = 'light' | 'dark' | 'system'
 
-const detectClientOS = (): 'windows' | 'darwin' | 'linux' => {
+export type ClientOS = 'windows' | 'darwin' | 'linux'
+
+export const detectClientOS = (): ClientOS => {
   if (typeof navigator === 'undefined') {
     return 'linux'
   }

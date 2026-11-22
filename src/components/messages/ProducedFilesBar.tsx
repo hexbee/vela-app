@@ -1,6 +1,6 @@
 import clsx from 'clsx'
 import { memo, useState } from 'react'
-import { useTranslate } from '../../i18n/index.js'
+import { revealInFileManagerKey, useTranslate } from '../../i18n/index.js'
 import {
   basenameOfPath,
   openWorkspacePath,
@@ -20,6 +20,8 @@ const fileBadge = (filePath: string): string => {
   return name.slice(dot + 1, dot + 6).toUpperCase()
 }
 
+const DEFAULT_VISIBLE_FILES = 6
+
 export const ProducedFilesBar = memo(function ProducedFilesBar({
   files,
   title,
@@ -31,10 +33,14 @@ export const ProducedFilesBar = memo(function ProducedFilesBar({
 }) {
   const t = useTranslate()
   const [previewPath, setPreviewPath] = useState<string | null>(null)
+  const [expanded, setExpanded] = useState(false)
 
   if (files.length === 0) {
     return null
   }
+
+  const hiddenCount = files.length - DEFAULT_VISIBLE_FILES
+  const visibleFiles = expanded || hiddenCount <= 0 ? files : files.slice(0, DEFAULT_VISIBLE_FILES)
 
   const handleSaveAs = async (filePath: string) => {
     try {
@@ -52,7 +58,7 @@ export const ProducedFilesBar = memo(function ProducedFilesBar({
       <div className={clsx(styles.container, compact && styles.compact)}>
         {title ? <div className={styles.title}>{title}</div> : null}
         <div className={styles.list}>
-          {files.map((filePath) => (
+          {visibleFiles.map((filePath) => (
             <div key={filePath} className={styles.chip} title={filePath}>
               <span className={styles.badge}>{fileBadge(filePath)}</span>
               <span className={styles.name}>{basenameOfPath(filePath)}</span>
@@ -89,11 +95,22 @@ export const ProducedFilesBar = memo(function ProducedFilesBar({
                     void revealWorkspaceInFinder(filePath)
                   }}
                 >
-                  {t('workspaceRevealInFinder')}
+                  {t(revealInFileManagerKey)}
                 </button>
               </div>
             </div>
           ))}
+          {hiddenCount > 0 ? (
+            <button
+              type="button"
+              className={styles.toggleBtn}
+              onClick={() => setExpanded((prev) => !prev)}
+            >
+              {expanded
+                ? t('toolProducedFilesShowLess')
+                : t('toolProducedFilesShowMore', { count: hiddenCount })}
+            </button>
+          ) : null}
         </div>
       </div>
       {previewPath ? (
