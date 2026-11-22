@@ -27,15 +27,17 @@
 - **透出菜单展开态（`src/components/sider/SessionItem.tsx`）**：直接复用 `<Menu>` 已向 `children` 提供的 `{ open, toggle }`，不在 `SessionItem` 中维护重复状态；在 `...` 对应的 `IconButton` 上补充 `aria-expanded={open}` 与 `aria-haspopup="menu"`（`IconButton` 原生透传 `ButtonHTMLAttributes`）。
 
 ```tsx
-{({ open, toggle }) => (
-  <IconButton
-    icon={<IconEllipsisOutline16 />}
-    aria-label={t('more')}
-    aria-expanded={open}
-    aria-haspopup="menu"
-    onClick={toggle}
-  />
-)}
+{
+  ;({ open, toggle }) => (
+    <IconButton
+      icon={<IconEllipsisOutline16 />}
+      aria-label={t('more')}
+      aria-expanded={open}
+      aria-haspopup="menu"
+      onClick={toggle}
+    />
+  )
+}
 ```
 
 - **更新桌面端悬停样式（`src/components/sider/SessionItem.module.css`）**：在 `@media (hover: hover)` 中将 `[aria-expanded='true']` 并入未激活行的悬停底色及 `.action` 的显示条件。

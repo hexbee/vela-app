@@ -13,6 +13,7 @@
 此前 `vela-app` 仅在 macOS（`sandbox-exec` / Seatbelt）和 Linux（`bwrap` / bubblewrap）实现了 OS 级沙盒；Windows 编译命中 `tools_sandbox_other.go`，`isOSSandboxAvailable()` 恒返回 `false`。
 
 这带来两个直接问题：
+
 1. **缺少内核级写隔离**：Windows 下 `workspace-write` 模式的命令直接以宿主进程完整权限运行。
 2. **审批弹窗极频繁**：`tools_policy.go` 中 `workspace-write` 模式只有在 `osSandboxAvailableFn() == true` 时才启用「默认放行 + 仅黑名单弹窗」快路径；Windows 下被迫退化为极窄的 Unix 只读白名单，几乎所有命令（含常见构建/测试命令及复合管道命令）都触发人工审批。
 
@@ -55,10 +56,10 @@
 
 ### 2.3 工作区常驻授权 vs 私有临时目录隔离
 
-| 目录类型 | SID 派生规则 | 生命周期 | 并发与性能优化 |
-|---|---|---|---|
-| **工作区根目录** | `S-1-4-<x>-<y>`（SHA-256 规范化小写路径） | **常驻**（不撤销，作为跨会话复用缓存） | 每路径排他 `LockFileEx` 锁；检测精确 Allow ACE + Deny ACE + Low 标签已存在时 O(1) 跳过，避免重复全树传播 |
-| **私有临时目录** | `S-1-4-<x>-<y>-1`（SHA-256 `"temp\x00"+path`，三段子权限域隔离） | **可回收**（命令/任务退出后撤销 ACL 并删除目录） | 绝不隐式授权全局 `%TEMP%`；强校验与工作区不相交；重写子进程 `TMP`/`TEMP` 指向私有目录 |
+| 目录类型         | SID 派生规则                                                     | 生命周期                                         | 并发与性能优化                                                                                           |
+| ---------------- | ---------------------------------------------------------------- | ------------------------------------------------ | -------------------------------------------------------------------------------------------------------- |
+| **工作区根目录** | `S-1-4-<x>-<y>`（SHA-256 规范化小写路径）                        | **常驻**（不撤销，作为跨会话复用缓存）           | 每路径排他 `LockFileEx` 锁；检测精确 Allow ACE + Deny ACE + Low 标签已存在时 O(1) 跳过，避免重复全树传播 |
+| **私有临时目录** | `S-1-4-<x>-<y>-1`（SHA-256 `"temp\x00"+path`，三段子权限域隔离） | **可回收**（命令/任务退出后撤销 ACL 并删除目录） | 绝不隐式授权全局 `%TEMP%`；强校验与工作区不相交；重写子进程 `TMP`/`TEMP` 指向私有目录                    |
 
 ### 2.4 进程启动与生命周期管理
 
@@ -81,19 +82,19 @@
 
 ## 3. 代码结构与文件清单
 
-| 文件 | 状态 | 职责说明 |
-|---|---|---|
-| `tools_sandbox_windows.go` | 新增 | Windows ACL 受限令牌、Low 完整性、Default DACL、`LockFileEx`、幂等授权/撤销、可用性探测与 `prepareSandboxedShellCommand` |
-| `tools_sandbox_windows_sid.go` | 新增 | 跨平台工作区/临时目录 SID 派生、锁文件名哈希、大小写不敏感环境变量覆盖、目录重叠检测 |
-| `tools_sandbox_windows_sid_test.go` | 新增 | 跨平台单元测试（SID 确定性与域隔离、环境变量覆盖、目录重叠、Windows 拒绝签名） |
-| `tools_sandbox_windows_win_test.go` | 新增 | Windows 专用测试（受限令牌不带 `CREATE_NO_WINDOW`、工作区内写成功 + 工作区外写拦截） |
-| `tools_sandbox.go` | 修改 | `sandboxSpec` 新增纯工作区列表 `workspaceRoots`；新增 `sandboxedShellCommand` 与 `collectSandboxWorkspaceRoots`；`looksLikeSandboxDenial` 补充 Windows/PowerShell 拒绝签名 |
-| `tools_sandbox_darwin.go` | 修改 | 适配 `prepareSandboxedShellCommand` |
-| `tools_sandbox_linux.go` | 修改 | 适配 `prepareSandboxedShellCommand` |
-| `tools_sandbox_other.go` | 修改 | 构建标签改为 `!darwin && !linux && !windows`，适配 `prepareSandboxedShellCommand` |
-| `tools_shell_windows.go` | 修改 | `configureProcessGroup` 在 `Token != 0` 时跳过 `CREATE_NO_WINDOW` |
-| `tools_shell.go` | 修改 | 接入 `prepareSandboxedShellCommand`（fail-closed）与前台/取消/启动失败清理 |
-| `tools_jobs.go` | 修改 | `backgroundJob` 持有 `sandboxCleanup`，在 `finish()` 中执行退出后回收 |
+| 文件                                | 状态 | 职责说明                                                                                                                                                                   |
+| ----------------------------------- | ---- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tools_sandbox_windows.go`          | 新增 | Windows ACL 受限令牌、Low 完整性、Default DACL、`LockFileEx`、幂等授权/撤销、可用性探测与 `prepareSandboxedShellCommand`                                                   |
+| `tools_sandbox_windows_sid.go`      | 新增 | 跨平台工作区/临时目录 SID 派生、锁文件名哈希、大小写不敏感环境变量覆盖、目录重叠检测                                                                                       |
+| `tools_sandbox_windows_sid_test.go` | 新增 | 跨平台单元测试（SID 确定性与域隔离、环境变量覆盖、目录重叠、Windows 拒绝签名）                                                                                             |
+| `tools_sandbox_windows_win_test.go` | 新增 | Windows 专用测试（受限令牌不带 `CREATE_NO_WINDOW`、工作区内写成功 + 工作区外写拦截）                                                                                       |
+| `tools_sandbox.go`                  | 修改 | `sandboxSpec` 新增纯工作区列表 `workspaceRoots`；新增 `sandboxedShellCommand` 与 `collectSandboxWorkspaceRoots`；`looksLikeSandboxDenial` 补充 Windows/PowerShell 拒绝签名 |
+| `tools_sandbox_darwin.go`           | 修改 | 适配 `prepareSandboxedShellCommand`                                                                                                                                        |
+| `tools_sandbox_linux.go`            | 修改 | 适配 `prepareSandboxedShellCommand`                                                                                                                                        |
+| `tools_sandbox_other.go`            | 修改 | 构建标签改为 `!darwin && !linux && !windows`，适配 `prepareSandboxedShellCommand`                                                                                          |
+| `tools_shell_windows.go`            | 修改 | `configureProcessGroup` 在 `Token != 0` 时跳过 `CREATE_NO_WINDOW`                                                                                                          |
+| `tools_shell.go`                    | 修改 | 接入 `prepareSandboxedShellCommand`（fail-closed）与前台/取消/启动失败清理                                                                                                 |
+| `tools_jobs.go`                     | 修改 | `backgroundJob` 持有 `sandboxCleanup`，在 `finish()` 中执行退出后回收                                                                                                      |
 
 ---
 
@@ -145,6 +146,7 @@ go test -v ./...
 ```
 
 手工核对项：
+
 1. `workspace-write` 模式下，在工作区内执行 `go test` / `echo hi > a.txt` **无需弹窗**且成功执行，ToolCallCard 显示「沙箱隔离」徽章。
 2. 尝试向工作区外（如桌面或用户目录）写入文件时，被内核拦截并输出 `[sandbox: kernel blocked ...]`。
 3. GUI 启动 `Vela` 时执行多条命令，确认无黑色控制台窗口闪烁。
