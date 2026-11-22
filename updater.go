@@ -246,13 +246,123 @@ func (s *UpdateService) DismissUpdate() bool {
 	return true
 }
 
+type gitHubReleaseAsset struct {
+	Name               string `json:"name"`
+	BrowserDownloadURL string `json:"browser_download_url"`
+}
+
 type gitHubRelease struct {
-	TagName string `json:"tag_name"`
-	Body    string `json:"body"`
-	Assets  []struct {
-		Name               string `json:"name"`
-		BrowserDownloadURL string `json:"browser_download_url"`
-	} `json:"assets"`
+	TagName string               `json:"tag_name"`
+	Body    string               `json:"body"`
+	Assets  []gitHubReleaseAsset `json:"assets"`
+}
+
+func matchSuffixRank(name string, suffixes []string) int {
+	for i, s := range suffixes {
+		if strings.HasSuffix(name, s) {
+			return i
+		}
+	}
+	return -1
+}
+
+func platformAssetExtensions(goos string) (exclusive []string, shared []string) {
+	switch goos {
+	case "darwin":
+		return []string{".dmg"}, []string{".tar.gz", ".zip"}
+	case "windows":
+		return []string{".exe", ".msi"}, []string{".zip", ".tar.gz"}
+	case "linux":
+		return []string{".deb", ".rpm", ".appimage"}, []string{".tar.gz", ".zip"}
+	default:
+		return nil, nil
+	}
+}
+
+func matchesArch(lowerName, goarch string) bool {
+	switch goarch {
+	case "amd64":
+		return strings.Contains(lowerName, "amd64") || strings.Contains(lowerName, "x86_64") || strings.Contains(lowerName, "x64")
+	case "arm64":
+		return strings.Contains(lowerName, "arm64") || strings.Contains(lowerName, "aarch64")
+	default:
+		return strings.Contains(lowerName, goarch)
+	}
+}
+
+func mentionsOtherOS(lowerName, goos string) bool {
+	for _, other := range []string{"darwin", "macos", "windows", "linux"} {
+		if other == goos || (goos == "darwin" && other == "macos") {
+			continue
+		}
+		if strings.Contains(lowerName, other) {
+			return true
+		}
+	}
+	return false
+}
+
+// selectGitHubReleaseAsset picks the best fallback release asset for goos/goarch.
+// Naming contract (aligned with `mygo build` outputs):
+//   - Asset filenames must include an architecture token (amd64/x86_64/x64 or arm64/aarch64);
+//     universal or arch-less bundles (e.g. an arch-less .dmg) are intentionally not matched.
+//   - Explicit OS matching recognizes goos (plus "macos" for darwin) and rejects names
+//     mentioning another OS among darwin/macos/windows/linux; aliases like "osx"/"mac" are not matched.
+//   - Tier 1 (explicit OS + arch) beats Tier 2 (OS-exclusive extension + arch); within the same
+//     tier, earlier extensions in platformAssetExtensions win (installers before generic archives).
+func selectGitHubReleaseAsset(assets []gitHubReleaseAsset, goos, goarch string) string {
+	goos = strings.ToLower(strings.TrimSpace(goos))
+	goarch = strings.ToLower(strings.TrimSpace(goarch))
+	exclusiveExts, sharedExts := platformAssetExtensions(goos)
+	if goos == "" || goarch == "" || (len(exclusiveExts) == 0 && len(sharedExts) == 0) {
+		return ""
+	}
+
+	bestURL := ""
+	bestTier := 0
+	bestRank := 0
+
+	for _, a := range assets {
+		lower := strings.ToLower(strings.TrimSpace(a.Name))
+		if lower == "" {
+			continue
+		}
+
+		isExclusive := false
+		extRank := matchSuffixRank(lower, exclusiveExts)
+		if extRank >= 0 {
+			isExclusive = true
+		} else {
+			sharedRank := matchSuffixRank(lower, sharedExts)
+			if sharedRank < 0 {
+				continue
+			}
+			extRank = len(exclusiveExts) + sharedRank
+		}
+
+		if !matchesArch(lower, goarch) || mentionsOtherOS(lower, goos) {
+			continue
+		}
+
+		var tier int
+		if strings.Contains(lower, goos) || (goos == "darwin" && strings.Contains(lower, "macos")) {
+			// Tier 1: explicit OS + arch match (prefer platform-exclusive installers over generic archives).
+			tier = 1
+		} else if isExclusive {
+			// Tier 2: OS-exclusive extension + arch match (e.g. vela-setup-0.3.5-amd64.exe, vela-0.3.5-arm64.dmg).
+			tier = 2
+		} else {
+			continue
+		}
+
+		if bestURL == "" || tier < bestTier || (tier == bestTier && extRank < bestRank) {
+			bestURL = a.BrowserDownloadURL
+			bestTier = tier
+			bestRank = extRank
+		}
+	}
+
+	return bestURL
 }
 
 func checkGitHubRelease(ctx context.Context, repo string) (string, string, string, error) {
@@ -279,19 +389,7 @@ func checkGitHubRelease(ctx context.Context, repo string) (string, string, strin
 	}
 
 	version := strings.TrimPrefix(rel.TagName, "v")
-
-	// Match platform asset
-	var targetAsset string
-	matchKeyword := fmt.Sprintf("%s-%s", runtime.GOOS, runtime.GOARCH)
-	for _, a := range rel.Assets {
-		if strings.Contains(strings.ToLower(a.Name), matchKeyword) || strings.Contains(strings.ToLower(a.Name), runtime.GOARCH) {
-			targetAsset = a.BrowserDownloadURL
-			break
-		}
-	}
-	if targetAsset == "" && len(rel.Assets) > 0 {
-		targetAsset = rel.Assets[0].BrowserDownloadURL
-	}
+	targetAsset := selectGitHubReleaseAsset(rel.Assets, runtime.GOOS, runtime.GOARCH)
 
 	return version, rel.Body, targetAsset, nil
 }
