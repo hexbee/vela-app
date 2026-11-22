@@ -91,8 +91,13 @@ git push origin main && git push origin vX.Y.Z
 
 等待构建与 GitHub Release（`hexbee/vela-app`）发布完成后，核对：
 
-- macOS / Windows 各目标架构安装包资产齐全。
+- macOS / Windows / Linux 各目标架构安装包资产齐全。
 - MyGo 自动更新元数据与签名清单已正确生成（公钥配置见 `mygo.config.ts` 的 `updates.publicKey`）。
+- 增量更新资产（`*.delta`）数量符合预期（`目标平台数 × min(3, 已发布历史版本数)`，当前配置为 6 × 3 = 18），且 `publish-release` 中的清单引用完整性校验已通过：
+  ```bash
+  gh release view vX.Y.Z --json assets \
+    --jq '[.assets[].name | select(endswith(".delta"))] | length'
+  ```
 
 ---
 

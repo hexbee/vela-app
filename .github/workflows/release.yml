@@ -53,16 +53,93 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          find build -type f \( -name "*.dmg" -o -name "*.exe" -o -name "*.deb" -o -name "*.rpm" -o -name "*.tar.gz" -o -name "*.json" \) | while read -r file; do
-            echo "Uploading $file..."
-            gh release upload "$GITHUB_REF_NAME" "$file" --repo "$GITHUB_REPOSITORY" --clobber
-          done
+          set -euo pipefail
+          assets=()
+          manifests=()
+          while IFS= read -r -d '' file; do
+            case "$file" in
+              *.json) manifests+=("$file") ;;
+              *) assets+=("$file") ;;
+            esac
+          done < <(find build -type f \( -name "*.dmg" -o -name "*.exe" -o -name "*.deb" -o -name "*.rpm" -o -name "*.tar.gz" -o -name "*.delta" -o -name "*.json" \) -print0)
+
+          if [ "${#assets[@]}" -eq 0 ] && [ "${#manifests[@]}" -eq 0 ]; then
+            echo "::error::No release assets found under build/"
+            exit 1
+          fi
+
+          # Upload binaries/archives/deltas before update-*.json manifests so a manual
+          # re-run of this job on an already-published release never exposes dangling URLs.
+          if [ "${#assets[@]}" -gt 0 ]; then
+            for file in "${assets[@]}"; do
+              echo "Uploading $file..."
+              gh release upload "$GITHUB_REF_NAME" "$file" --repo "$GITHUB_REPOSITORY" --clobber
+            done
+          fi
+          if [ "${#manifests[@]}" -gt 0 ]; then
+            for file in "${manifests[@]}"; do
+              echo "Uploading $file..."
+              gh release upload "$GITHUB_REF_NAME" "$file" --repo "$GITHUB_REPOSITORY" --clobber
+            done
+          fi
 
   publish-release:
     if: "!contains(github.ref_name, '-')"
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - name: Verify release manifest references
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tmp_dir="$(mktemp -d)"
+          trap 'rm -rf "$tmp_dir"' EXIT
+          mkdir -p "$tmp_dir/manifests"
+
+          declare -A asset_sizes=()
+          while IFS=$'\t' read -r name size; do
+            [ -n "$name" ] || continue
+            asset_sizes["$name"]="$size"
+          done < <(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json assets \
+            --jq '.assets[] | "\(.name)\t\(.size)"')
+
+          if ! gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --pattern "update-*.json" --dir "$tmp_dir/manifests"; then
+            echo "::error::No update-*.json manifests could be downloaded from release $GITHUB_REF_NAME"
+            exit 1
+          fi
+
+          manifest_count=0
+          errors=0
+          for manifest in "$tmp_dir/manifests"/update-*.json; do
+            [ -f "$manifest" ] || continue
+            manifest_count=$((manifest_count + 1))
+            while IFS=$'\t' read -r url expected_size; do
+              [ -n "$url" ] || continue
+              asset_name="$(basename "${url%%\?*}")"
+              if [ -z "${asset_sizes[$asset_name]+x}" ]; then
+                echo "::error::Missing asset '$asset_name' referenced by $(basename "$manifest")"
+                errors=$((errors + 1))
+                continue
+              fi
+              actual_size="${asset_sizes[$asset_name]}"
+              if [ -n "$expected_size" ] && [ "$actual_size" != "$expected_size" ]; then
+                echo "::error::Size mismatch for '$asset_name' referenced by $(basename "$manifest"): expected $expected_size, got $actual_size"
+                errors=$((errors + 1))
+              fi
+            done < <(jq -r '[., (.deltas // [] | .[])] | .[] | select((.url | type) == "string" and (.url | length) > 0) | "\(.url)\t\(.size // "")"' "$manifest")
+          done
+
+          if [ "$manifest_count" -eq 0 ]; then
+            echo "::error::No update-*.json manifests found in release $GITHUB_REF_NAME"
+            exit 1
+          fi
+          if [ "$errors" -gt 0 ]; then
+            echo "::error::Release $GITHUB_REF_NAME failed manifest verification with $errors error(s); aborting publish"
+            exit 1
+          fi
+          echo "Verified $manifest_count update manifest(s): all referenced assets exist with matching sizes."
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
