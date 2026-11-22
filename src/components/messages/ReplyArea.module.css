@@ -61,6 +61,7 @@
   overflow-y: auto;
   overscroll-behavior-y: auto;
   scrollbar-gutter: stable;
+  isolation: isolate;
 }
 
 .stepsContent {
@@ -68,22 +69,27 @@
   flex-direction: column;
 }
 
-.fadeTop {
-  mask-image: linear-gradient(to bottom, transparent 0, #000 24px, #000 100%);
+/* 渐隐遮罩依赖外层消息区背景为 --dsw-alias-bg-base，z-index: 1 始终低于吸顶标题（2）。 */
+.fadeTop::before,
+.fadeBottom::after {
+  content: '';
+  display: block;
+  position: sticky;
+  z-index: 1;
+  height: 24px;
+  pointer-events: none;
 }
 
-.fadeBottom {
-  mask-image: linear-gradient(to bottom, #000 0, #000 calc(100% - 24px), transparent 100%);
+.fadeTop::before {
+  top: 0;
+  margin-bottom: -24px;
+  background: linear-gradient(to bottom, var(--dsw-alias-bg-base) 0%, transparent 100%);
 }
 
-.fadeTop.fadeBottom {
-  mask-image: linear-gradient(
-    to bottom,
-    transparent 0,
-    #000 24px,
-    #000 calc(100% - 24px),
-    transparent 100%
-  );
+.fadeBottom::after {
+  bottom: 0;
+  margin-top: -24px;
+  background: linear-gradient(to top, var(--dsw-alias-bg-base) 0%, transparent 100%);
 }
 
 .withLine,
@@ -160,7 +166,7 @@
 .thinkRowExpanded > .thinkHeader {
   position: sticky;
   top: 0;
-  z-index: 1;
+  z-index: 2;
   background-color: var(--dsw-alias-bg-base);
 }
 

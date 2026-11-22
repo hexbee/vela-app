@@ -158,6 +158,7 @@ export const ReplyArea = memo(function ReplyArea({
     syncScrollEdges()
   }, [syncScrollEdges])
 
+  // 滚轮/触摸离开底部阈值外时停止自动贴底。
   const interruptFollow = useCallback(() => {
     const el = bodyRef.current
     if (!el) {
@@ -167,6 +168,11 @@ export const ReplyArea = memo(function ReplyArea({
     if (distanceFromBottom > FOLLOW_THRESHOLD_PX) {
       followingRef.current = false
     }
+  }, [])
+
+  // 用户手动展开步骤时无条件暂停自动贴底，避免新展开内容被立刻顶出视口。
+  const pauseFollow = useCallback(() => {
+    followingRef.current = false
   }, [])
 
   // 监听内部高度变化：流式阶段若仍在跟随底部，则自动贴底并更新上下渐隐状态。
@@ -259,6 +265,7 @@ export const ReplyArea = memo(function ReplyArea({
                 streaming={streaming}
                 isLast={index === view.steps.length - 1}
                 defaultExpandThinking={singleThinkingOnly}
+                onExpandStep={pauseFollow}
               />
             ))}
           </div>
@@ -283,6 +290,7 @@ const StepItem = ({
   streaming,
   isLast,
   defaultExpandThinking,
+  onExpandStep,
 }: {
   step: Step
   message: AssistantMessage
@@ -290,6 +298,7 @@ const StepItem = ({
   streaming: boolean
   isLast: boolean
   defaultExpandThinking: boolean
+  onExpandStep: () => void
 }) => {
   switch (step.type) {
     case 'thinking':
@@ -300,6 +309,7 @@ const StepItem = ({
           streaming={streaming}
           isLast={isLast}
           defaultExpanded={defaultExpandThinking}
+          onExpand={onExpandStep}
         />
       )
     case 'text':
@@ -323,7 +333,7 @@ const StepItem = ({
     case 'read_link':
       return <ReadLinkRow step={step} isLast={isLast} />
     case 'client_tool':
-      return <ToolCallCard step={step} isLast={isLast} />
+      return <ToolCallCard step={step} isLast={isLast} onExpand={onExpandStep} />
     default:
       return null
   }
@@ -336,12 +346,14 @@ const ThinkingRow = memo(function ThinkingRow({
   streaming,
   isLast,
   defaultExpanded,
+  onExpand,
 }: {
   step: ThinkingStep
   messageId: string
   streaming: boolean
   isLast: boolean
   defaultExpanded: boolean
+  onExpand: () => void
 }) {
   const t = useTranslate()
   const [expanded, setExpanded] = useState(defaultExpanded)
@@ -368,7 +380,12 @@ const ThinkingRow = memo(function ThinkingRow({
         type="button"
         className={styles.thinkHeader}
         aria-expanded={expanded}
-        onClick={() => setExpanded((value) => !value)}
+        onClick={() => {
+          if (!expanded) {
+            onExpand()
+          }
+          setExpanded((value) => !value)
+        }}
       >
         <span className={clsx(styles.thinkLabel, active && styles.shimmer)}>
           {t(active ? 'toolThinkingStepRunning' : 'toolThinkingStepLabel')}

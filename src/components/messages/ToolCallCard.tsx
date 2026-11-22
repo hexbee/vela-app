@@ -44,9 +44,11 @@ const summarizeToolCall = (name: string, input: Record<string, unknown>): string
 export const ToolCallCard = memo(function ToolCallCard({
   step,
   isLast,
+  onExpand,
 }: {
   step: ClientToolStep
   isLast: boolean
+  onExpand?: () => void
 }) {
   const t = useTranslate()
   const pendingApproval = useChatStore((state) =>
@@ -131,7 +133,12 @@ export const ToolCallCard = memo(function ToolCallCard({
         <button
           type="button"
           className={styles.header}
-          onClick={() => setExpanded((value) => !value)}
+          onClick={() => {
+            if (!expanded) {
+              onExpand?.()
+            }
+            setExpanded((value) => !value)
+          }}
         >
           <span className={styles.toolName}>{step.use.name}</span>
           {sandboxed ? <span className={styles.metaBadge}>{t('toolSandboxedBadge')}</span> : null}
