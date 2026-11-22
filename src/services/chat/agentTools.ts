@@ -143,7 +143,7 @@ export const CLIENT_FILE_TOOLS: ClientToolDefinition[] = [
   {
     name: 'bash',
     description:
-      'Execute a shell command (bash on macOS/Linux, PowerShell on Windows) in the active workspace or isolated temporary directory. Strict read-only commands run automatically; write/build/test commands require one-time user approval. Non-zero exit codes are returned as normal output with [exit code: N]. Commands running past timeoutMs are automatically moved to a background job so you can inspect them with job_output or stop them with job_kill. Prefer delete_file over rm.',
+      'Execute a shell command (bash on macOS/Linux, PowerShell on Windows) in the active workspace or isolated temporary directory. Strict read-only commands run automatically; write/build/test commands run inside the OS sandbox (or request approval when needed). If the sandbox blocks an operation ([sandbox: ...]), you may retry that exact command once with sandbox_permissions (the narrowest wider mode that suffices) and a one-sentence justification to ask the user for one-time approval. Non-zero exit codes are returned as normal output with [exit code: N]. Commands running past timeoutMs are automatically moved to a background job so you can inspect them with job_output or stop them with job_kill. Prefer delete_file over rm.',
     input_schema: {
       type: 'object',
       properties: {
@@ -163,6 +163,17 @@ export const CLIENT_FILE_TOOLS: ClientToolDefinition[] = [
         timeoutMs: {
           type: 'integer',
           description: 'Optional timeout in milliseconds (default 60000, max 300000).',
+        },
+        sandbox_permissions: {
+          type: 'string',
+          enum: ['workspace-write', 'full-access'],
+          description:
+            'Optional one-time sandbox escalation mode to retry after a sandbox denial (choose the narrowest wider mode that suffices). Must be paired with justification; always prompts the user for one-time approval.',
+        },
+        justification: {
+          type: 'string',
+          description:
+            'One-sentence reason for requesting sandbox_permissions, shown directly in the user approval prompt (use the user language).',
         },
       },
       required: ['command'],

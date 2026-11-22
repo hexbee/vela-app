@@ -283,6 +283,20 @@ func (s *ToolService) ClearSessionApprovals(sessionID string) error {
 	return nil
 }
 
+// ReleaseSessionSandbox revokes and removes any pooled sandbox private temp directories
+// associated with sessionID once active commands finish.
+func (s *ToolService) ReleaseSessionSandbox(sessionID string) error {
+	releaseSessionSandboxTemp(sessionID)
+	return nil
+}
+
+// CleanupWorkspaceSandboxACL revokes the standing Windows ACL capability ACE and
+// Low mandatory integrity label previously materialized on workspacePath.
+// Returns (false, nil) on non-Windows platforms.
+func (s *ToolService) CleanupWorkspaceSandboxACL(workspacePath string) (bool, error) {
+	return cleanupWorkspaceSandboxACL(workspacePath)
+}
+
 func (s *ToolService) isSessionAllowed(sessionID, key string) bool {
 	if sessionID == "" || key == "" {
 		return false

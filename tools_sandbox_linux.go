@@ -63,3 +63,19 @@ func buildSandboxedShellCommand(command string, spec sandboxSpec) (*exec.Cmd, bo
 	args = append(args, "--", shell, "-c", command)
 	return exec.Command(bwrapPath, args...), true
 }
+
+func prepareSandboxedShellCommand(command string, spec sandboxSpec, baseEnv []string) (sandboxedShellCommand, error) {
+	cmd, sandboxed := buildSandboxedShellCommand(command, spec)
+	cmd.Env = baseEnv
+	return sandboxedShellCommand{
+		cmd:       cmd,
+		sandboxed: sandboxed,
+	}, nil
+}
+
+func releaseSessionSandboxTemp(_ string) {}
+func releaseAllSandboxTemps()            {}
+
+func cleanupWorkspaceSandboxACL(_ string) (bool, error) {
+	return false, nil
+}

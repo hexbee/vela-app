@@ -21,6 +21,10 @@ func configureProcessGroup(cmd *exec.Cmd) {
 	}
 }
 
+func attachProcessTree(_ *exec.Cmd) func() {
+	return nil
+}
+
 func killProcessTree(cmd *exec.Cmd) {
 	if cmd == nil || cmd.Process == nil {
 		return

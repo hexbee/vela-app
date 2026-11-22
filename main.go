@@ -272,6 +272,7 @@ func main() {
 	})
 
 	defer globalMCPService.StopAll()
+	defer releaseAllSandboxTemps()
 	if err := mygo.App.Run(); err != nil {
 		log.Fatal(err)
 	}

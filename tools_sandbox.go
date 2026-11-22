@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 )
@@ -12,9 +13,17 @@ var osSandboxAvailableFn = isOSSandboxAvailable
 
 // sandboxSpec describes the OS-level sandbox policy applied to a bash command.
 type sandboxSpec struct {
+	sessionID       string // Active session ID for session-scoped private temp reuse (Windows ACL sandbox)
 	mode            string // PermissionReadOnly | PermissionWorkspaceWrite | PermissionFullAccess
 	writableRoots   []string
+	workspaceRoots  []string // Explicit workspace roots without ambient temp dirs (used by Windows ACL sandbox)
 	deniedReadPaths []string
+}
+
+type sandboxedShellCommand struct {
+	cmd       *exec.Cmd
+	sandboxed bool
+	cleanup   func()
 }
 
 func escapeSBPLString(p string) string {
@@ -83,6 +92,30 @@ func collectSandboxWritableRoots(mode string, dirs ...string) []string {
 	return roots
 }
 
+func collectSandboxWorkspaceRoots(mode string, dirs ...string) []string {
+	if mode != PermissionWorkspaceWrite {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var roots []string
+	for _, d := range dirs {
+		d = strings.TrimSpace(d)
+		if d == "" {
+			continue
+		}
+		cleaned := filepath.Clean(d)
+		if canonical, err := canonicalizePath(cleaned); err == nil {
+			cleaned = canonical
+		}
+		key := strings.ToLower(cleaned)
+		if !seen[key] {
+			seen[key] = true
+			roots = append(roots, cleaned)
+		}
+	}
+	return roots
+}
+
 var sensitiveCredentialRelPaths = []string{
 	".ssh",
 	".aws",
@@ -140,5 +173,9 @@ func collectSensitiveReadDenyPaths(activeDirs ...string) []string {
 func looksLikeSandboxDenial(stderr string) bool {
 	lower := strings.ToLower(stderr)
 	return strings.Contains(lower, "operation not permitted") ||
-		strings.Contains(lower, "read-only file system")
+		strings.Contains(lower, "read-only file system") ||
+		strings.Contains(lower, "access is denied") ||
+		(strings.Contains(lower, "access to the path") && strings.Contains(lower, "is denied")) ||
+		strings.Contains(lower, "unauthorizedaccessexception") ||
+		strings.Contains(lower, "permission denied")
 }

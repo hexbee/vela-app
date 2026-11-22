@@ -9,23 +9,25 @@ export type Locale = 'zh-CN' | 'en-US'
 /** 主题偏好；默认跟随系统 */
 export type ThemePreference = 'light' | 'dark' | 'system'
 
-/** 沙箱生效时（工作区内修改模式）默认需要人工审批的命令黑名单 */
-export const DEFAULT_APPROVAL_BLACKLIST: readonly string[] = [
+const detectClientOS = (): 'windows' | 'darwin' | 'linux' => {
+  if (typeof navigator === 'undefined') {
+    return 'linux'
+  }
+  const probe = `${navigator.platform ?? ''} ${navigator.userAgent ?? ''}`.toLowerCase()
+  if (probe.includes('win')) {
+    return 'windows'
+  }
+  if (probe.includes('mac')) {
+    return 'darwin'
+  }
+  return 'linux'
+}
+
+const COMMON_APPROVAL_BLACKLIST: readonly string[] = [
   'rm',
   'rmdir',
-  'sudo',
-  'su',
-  'mkfs',
-  'dd',
-  'chmod',
-  'chown',
   'shutdown',
-  'reboot',
-  'halt',
   'kill',
-  'killall',
-  'pkill',
-  'diskutil',
   'format',
   'git reset',
   'git clean',
@@ -54,6 +56,62 @@ export const DEFAULT_APPROVAL_BLACKLIST: readonly string[] = [
   'yarn publish',
   'cargo publish',
 ]
+
+const UNIX_APPROVAL_BLACKLIST: readonly string[] = [
+  'sudo',
+  'su',
+  'mkfs',
+  'dd',
+  'chmod',
+  'chown',
+  'reboot',
+  'halt',
+  'killall',
+  'pkill',
+]
+
+const WINDOWS_APPROVAL_BLACKLIST: readonly string[] = [
+  'remove-item',
+  'ri',
+  'del',
+  'erase',
+  'rd',
+  'stop-process',
+  'spps',
+  'taskkill',
+  'start-process',
+  'saps',
+  'invoke-expression',
+  'iex',
+  'icacls',
+  'takeown',
+  'reg',
+  'sc',
+  'net',
+  'netsh',
+  'diskpart',
+  'bcdedit',
+  'invoke-webrequest',
+  'iwr',
+  'invoke-restmethod',
+  'irm',
+  'bitsadmin',
+  'certutil',
+]
+
+const buildPlatformApprovalBlacklist = (): readonly string[] => {
+  const os = detectClientOS()
+  if (os === 'windows') {
+    return [...COMMON_APPROVAL_BLACKLIST, ...WINDOWS_APPROVAL_BLACKLIST]
+  }
+  if (os === 'darwin') {
+    return [...COMMON_APPROVAL_BLACKLIST, ...UNIX_APPROVAL_BLACKLIST, 'diskutil']
+  }
+  return [...COMMON_APPROVAL_BLACKLIST, ...UNIX_APPROVAL_BLACKLIST]
+}
+
+/** 沙箱生效时（工作区内修改模式）默认需要人工审批的命令黑名单（按当前操作系统裁剪） */
+export const DEFAULT_APPROVAL_BLACKLIST: readonly string[] = buildPlatformApprovalBlacklist()
 
 export const DEFAULT_SKILL_PROJECT_DIRS: readonly string[] = ['.agents/skills', '.vela/skills']
 export const DEFAULT_SKILL_USER_DIRS: readonly string[] = ['~/.agents/skills', '~/.vela/skills']

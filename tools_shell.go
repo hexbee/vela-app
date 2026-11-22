@@ -127,7 +127,14 @@ func (s *ToolService) executeBash(ctx context.Context, req ToolExecuteRequest) (
 		timeoutMs = bashMaxTimeoutMs
 	}
 
-	perm := normalizePermissionMode(req.PermissionMode)
+	basePerm := normalizePermissionMode(req.PermissionMode)
+	perm, escalated, _, escErr := parseSandboxEscalation(req, basePerm)
+	if escErr != "" {
+		return toolErrorResult("Error: "+escErr, req.Workdir)
+	}
+	if escalated && !req.Approved {
+		return toolErrorResult("Error: sandbox escalation requires explicit one-time user approval", req.Workdir)
+	}
 	inputWorkdir := strings.TrimSpace(stringInput(req.Input, "workdir"))
 	reqWorkdir := strings.TrimSpace(req.Workdir)
 
@@ -173,13 +180,23 @@ func (s *ToolService) executeBash(ctx context.Context, req ToolExecuteRequest) (
 	beforeSnap := snapshotDirFiles(cwd)
 
 	spec := sandboxSpec{
+		sessionID:       req.SessionID,
 		mode:            perm,
 		writableRoots:   collectSandboxWritableRoots(perm, cwd, reqWorkdir),
+		workspaceRoots:  collectSandboxWorkspaceRoots(perm, cwd, reqWorkdir),
 		deniedReadPaths: collectSensitiveReadDenyPaths(cwd, reqWorkdir),
 	}
-	cmd, sandboxed := buildSandboxedShellCommand(command, spec)
+	prepared, err := prepareSandboxedShellCommand(command, spec, sanitizeEnv(os.Environ()))
+	if err != nil {
+		if createdScratchNow && isDirEmpty(cwd) {
+			_ = os.Remove(cwd)
+		}
+		return toolErrorResult(fmt.Sprintf("Error preparing sandbox: %v", err), reqWorkdir)
+	}
+	cmd := prepared.cmd
+	sandboxed := prepared.sandboxed
+	cleanupSandbox := prepared.cleanup
 	cmd.Dir = cwd
-	cmd.Env = sanitizeEnv(os.Environ())
 	configureProcessGroup(cmd)
 
 	stdoutBuf := newRingBuffer(jobRingBufferBytes)
@@ -189,10 +206,22 @@ func (s *ToolService) executeBash(ctx context.Context, req ToolExecuteRequest) (
 
 	startedAt := time.Now()
 	if err := cmd.Start(); err != nil {
+		if cleanupSandbox != nil {
+			cleanupSandbox()
+		}
 		if createdScratchNow && isDirEmpty(cwd) {
 			_ = os.Remove(cwd)
 		}
 		return toolErrorResult(fmt.Sprintf("Error starting command: %v", err), reqWorkdir)
+	}
+	releaseJob := attachProcessTree(cmd)
+	cleanupAll := func() {
+		if releaseJob != nil {
+			releaseJob()
+		}
+		if cleanupSandbox != nil {
+			cleanupSandbox()
+		}
 	}
 
 	waitCh := make(chan error, 1)
@@ -205,6 +234,7 @@ func (s *ToolService) executeBash(ctx context.Context, req ToolExecuteRequest) (
 
 	select {
 	case waitErr := <-waitCh:
+		cleanupAll()
 		return finishForegroundBash(
 			waitErr,
 			false,
@@ -220,6 +250,7 @@ func (s *ToolService) executeBash(ctx context.Context, req ToolExecuteRequest) (
 	case <-ctx.Done():
 		killProcessTree(cmd)
 		waitErr := <-waitCh
+		cleanupAll()
 		return finishForegroundBash(
 			waitErr,
 			true,
@@ -246,6 +277,7 @@ func (s *ToolService) executeBash(ctx context.Context, req ToolExecuteRequest) (
 			done:              make(chan struct{}),
 			sandboxed:         sandboxed,
 			sandboxMode:       perm,
+			sandboxCleanup:    cleanupAll,
 			createdScratchNow: createdScratchNow,
 			beforeSnap:        beforeSnap,
 			status:            jobStatusRunning,
@@ -389,6 +421,10 @@ func finishForegroundBash(
 			out.WriteString("\n")
 		}
 		out.WriteString(fmt.Sprintf("[sandbox: kernel blocked a write outside allowed roots under %s mode]", perm))
+		if hint := sandboxEscalationHint(perm); hint != "" {
+			out.WriteString("\n")
+			out.WriteString(hint)
+		}
 	}
 	if out.Len() == 0 {
 		out.WriteString("(no output)")

@@ -437,6 +437,14 @@ export const ToolService = {
   classifyToolCall(req: ToolExecuteRequest): Promise<ToolClassifyResult> {
     return call("ToolService.ClassifyToolCall", req);
   },
+  /**
+   * CleanupWorkspaceSandboxACL revokes the standing Windows ACL capability ACE and
+   * Low mandatory integrity label previously materialized on workspacePath.
+   * Returns (false, nil) on non-Windows platforms.
+   */
+  cleanupWorkspaceSandboxACL(workspacePath: string): Promise<boolean> {
+    return call("ToolService.CleanupWorkspaceSandboxACL", workspacePath);
+  },
   /** ClearSessionApprovals revokes all in-memory session-scoped command approvals for sessionID. */
   clearSessionApprovals(sessionID: string): Promise<void> {
     return call("ToolService.ClearSessionApprovals", sessionID);
@@ -456,6 +464,13 @@ export const ToolService = {
   /** ListBackgroundJobs returns all background bash jobs for a session (or all sessions if sessionID is empty). */
   listBackgroundJobs(sessionID: string): Promise<BackgroundJobInfo[]> {
     return call("ToolService.ListBackgroundJobs", sessionID);
+  },
+  /**
+   * ReleaseSessionSandbox revokes and removes any pooled sandbox private temp directories
+   * associated with sessionID once active commands finish.
+   */
+  releaseSessionSandbox(sessionID: string): Promise<void> {
+    return call("ToolService.ReleaseSessionSandbox", sessionID);
   },
 } as const;
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -39,22 +40,38 @@ var powerShellWriteCmdlets = map[string]bool{
 
 // highRiskCommands require explicit one-time confirmation even in full-access mode.
 var highRiskCommands = map[string]bool{
-	"rm":       true,
-	"rmdir":    true,
-	"sudo":     true,
-	"su":       true,
-	"mkfs":     true,
-	"dd":       true,
-	"chmod":    true,
-	"chown":    true,
-	"shutdown": true,
-	"reboot":   true,
-	"halt":     true,
-	"kill":     true,
-	"killall":  true,
-	"pkill":    true,
-	"diskutil": true,
-	"format":   true,
+	"rm":                true,
+	"rmdir":             true,
+	"sudo":              true,
+	"su":                true,
+	"mkfs":              true,
+	"dd":                true,
+	"chmod":             true,
+	"chown":             true,
+	"shutdown":          true,
+	"reboot":            true,
+	"halt":              true,
+	"kill":              true,
+	"killall":           true,
+	"pkill":             true,
+	"diskutil":          true,
+	"format":            true,
+	"remove-item":       true,
+	"ri":                true,
+	"del":               true,
+	"erase":             true,
+	"rd":                true,
+	"stop-process":      true,
+	"spps":              true,
+	"taskkill":          true,
+	"invoke-expression": true,
+	"iex":               true,
+	"icacls":            true,
+	"takeown":           true,
+	"reg":               true,
+	"sc":                true,
+	"diskpart":          true,
+	"bcdedit":           true,
 }
 
 func classifyFileToolCall(req ToolExecuteRequest, perm string) ToolClassifyResult {
@@ -149,11 +166,74 @@ func classifyFileToolCall(req ToolExecuteRequest, perm string) ToolClassifyResul
 	return ToolClassifyResult{Decision: DecisionAllow}
 }
 
+func permissionRank(mode string) (int, bool) {
+	switch mode {
+	case PermissionReadOnly:
+		return 0, true
+	case PermissionWorkspaceWrite:
+		return 1, true
+	case PermissionFullAccess:
+		return 2, true
+	default:
+		return -1, false
+	}
+}
+
+// parseSandboxEscalation validates optional per-call sandbox_permissions + justification
+// escalation fields against basePerm (strictly wider ladder, fail-closed).
+func parseSandboxEscalation(req ToolExecuteRequest, basePerm string) (effectivePerm string, escalated bool, justification string, errMsg string) {
+	rawTarget := strings.TrimSpace(stringInput(req.Input, "sandbox_permissions"))
+	justification = strings.TrimSpace(stringInput(req.Input, "justification"))
+
+	if rawTarget == "" {
+		if justification != "" {
+			return basePerm, false, "", "justification requires sandbox_permissions"
+		}
+		return basePerm, false, "", ""
+	}
+
+	targetRank, ok := permissionRank(rawTarget)
+	if !ok {
+		return basePerm, false, "", fmt.Sprintf("invalid sandbox_permissions %q (expected %q or %q)", rawTarget, PermissionWorkspaceWrite, PermissionFullAccess)
+	}
+	baseRank, _ := permissionRank(basePerm)
+	if targetRank == baseRank {
+		// Repeating the current effective mode is a no-op and needs no escalation.
+		return basePerm, false, "", ""
+	}
+	if targetRank < baseRank {
+		return basePerm, false, "", fmt.Sprintf("sandbox_permissions %q is narrower than current mode %q", rawTarget, basePerm)
+	}
+	if justification == "" {
+		return basePerm, false, "", fmt.Sprintf("sandbox_permissions escalation (%s -> %s) requires a non-empty justification", basePerm, rawTarget)
+	}
+	return rawTarget, true, justification, ""
+}
+
+func sandboxEscalationHint(mode string) string {
+	switch mode {
+	case PermissionReadOnly:
+		return `[sandbox: escalation available — retry this exact command once with sandbox_permissions ("workspace-write" or "full-access", the narrowest mode that suffices) + justification to request one-time user approval]`
+	case PermissionWorkspaceWrite:
+		return `[sandbox: escalation available — retry this exact command once with sandbox_permissions ("full-access") + justification to request one-time user approval]`
+	default:
+		return ""
+	}
+}
+
 func classifyBashToolCall(req ToolExecuteRequest, perm string) ToolClassifyResult {
 	cmdStr := strings.TrimSpace(stringInput(req.Input, "command"))
 	if cmdStr == "" {
 		// Let ExecuteTool return a clean parameter error.
 		return ToolClassifyResult{Decision: DecisionAllow}
+	}
+
+	effectivePerm, escalated, justification, errMsg := parseSandboxEscalation(req, perm)
+	if errMsg != "" {
+		return ToolClassifyResult{
+			Decision: DecisionDeny,
+			Reason:   errMsg,
+		}
 	}
 
 	// Validate explicit workdir override if supplied.
@@ -165,23 +245,32 @@ func classifyBashToolCall(req ToolExecuteRequest, perm string) ToolClassifyResul
 				return ToolClassifyResult{Decision: DecisionDeny, Reason: err.Error()}
 			}
 		} else if !withinRoot {
-			if perm == PermissionReadOnly {
+			if effectivePerm == PermissionReadOnly {
 				return ToolClassifyResult{
 					Decision: DecisionDeny,
 					Reason:   fmt.Sprintf("workdir %q is outside the allowed workspace", inputWorkdir),
 				}
 			}
-			if perm == PermissionWorkspaceWrite {
+			if effectivePerm == PermissionWorkspaceWrite && !escalated {
 				return ToolClassifyResult{
 					Decision: DecisionAsk,
 					Reason:   fmt.Sprintf("running command in %q outside the workspace requires one-time approval", inputWorkdir),
 				}
 			}
 		}
-	} else if inputWorkdir != "" && strings.TrimSpace(req.Workdir) == "" && perm == PermissionReadOnly {
+	} else if inputWorkdir != "" && strings.TrimSpace(req.Workdir) == "" && effectivePerm == PermissionReadOnly {
 		return ToolClassifyResult{
 			Decision: DecisionDeny,
 			Reason:   "explicit workdir is not allowed in read-only mode without an active workspace",
+		}
+	}
+
+	// Any strictly wider sandbox_permissions request ALWAYS requires one-time user approval
+	// (empty SessionAllowKey) with the model's justification surfaced in the approval prompt.
+	if escalated {
+		return ToolClassifyResult{
+			Decision: DecisionAsk,
+			Reason:   fmt.Sprintf("one-time sandbox escalation (%s -> %s): %s", perm, effectivePerm, justification),
 		}
 	}
 
@@ -238,24 +327,11 @@ func classifyBashToolCall(req ToolExecuteRequest, perm string) ToolClassifyResul
 	}
 }
 
-// defaultSandboxApprovalBlacklist defines commands that require explicit one-time approval
-// even when OS-level sandbox-exec / bwrap is active in workspace-write mode.
-var defaultSandboxApprovalBlacklist = []string{
+var commonSandboxApprovalBlacklist = []string{
 	"rm",
 	"rmdir",
-	"sudo",
-	"su",
-	"mkfs",
-	"dd",
-	"chmod",
-	"chown",
 	"shutdown",
-	"reboot",
-	"halt",
 	"kill",
-	"killall",
-	"pkill",
-	"diskutil",
 	"format",
 	"git reset",
 	"git clean",
@@ -284,6 +360,69 @@ var defaultSandboxApprovalBlacklist = []string{
 	"yarn publish",
 	"cargo publish",
 }
+
+var unixSandboxApprovalBlacklist = []string{
+	"sudo",
+	"su",
+	"mkfs",
+	"dd",
+	"chmod",
+	"chown",
+	"reboot",
+	"halt",
+	"killall",
+	"pkill",
+}
+
+var windowsSandboxApprovalBlacklist = []string{
+	"remove-item",
+	"ri",
+	"del",
+	"erase",
+	"rd",
+	"stop-process",
+	"spps",
+	"taskkill",
+	"start-process",
+	"saps",
+	"invoke-expression",
+	"iex",
+	"icacls",
+	"takeown",
+	"reg",
+	"sc",
+	"net",
+	"netsh",
+	"diskpart",
+	"bcdedit",
+	"invoke-webrequest",
+	"iwr",
+	"invoke-restmethod",
+	"irm",
+	"bitsadmin",
+	"certutil",
+}
+
+// defaultSandboxApprovalBlacklistForOS returns the built-in sandbox approval blacklist
+// tailored to the target OS (common cross-platform rules + OS-specific rules).
+func defaultSandboxApprovalBlacklistForOS(goos string) []string {
+	out := make([]string, 0, len(commonSandboxApprovalBlacklist)+len(windowsSandboxApprovalBlacklist))
+	out = append(out, commonSandboxApprovalBlacklist...)
+	switch goos {
+	case "windows":
+		out = append(out, windowsSandboxApprovalBlacklist...)
+	case "darwin":
+		out = append(out, unixSandboxApprovalBlacklist...)
+		out = append(out, "diskutil")
+	default:
+		out = append(out, unixSandboxApprovalBlacklist...)
+	}
+	return out
+}
+
+// defaultSandboxApprovalBlacklist defines commands that require explicit one-time approval
+// even when OS-level sandbox-exec / bwrap / Windows ACL sandbox is active in workspace-write mode.
+var defaultSandboxApprovalBlacklist = defaultSandboxApprovalBlacklistForOS(runtime.GOOS)
 
 // extractAllCommandSegments splits a shell command across &&, ||, ;, |, &, newlines, subshells (...),
 // and recursively extracts inner $(...) / `...` substitutions so blacklisted commands cannot hide inside.
@@ -428,7 +567,7 @@ func matchApprovalBlacklist(cmdStr string, rules []string) (string, bool) {
 		if len(words) == 0 {
 			continue
 		}
-		cmd := strings.ToLower(filepath.Base(words[0]))
+		cmd := extractCommandNameFromSegment(seg, words[0])
 		var sub string
 		for _, w := range words[1:] {
 			if !strings.HasPrefix(w, "-") {
@@ -592,21 +731,80 @@ func isLoopbackURL(raw string) bool {
 }
 
 var externalSideEffectCommands = map[string]bool{
-	"curl":   true,
-	"wget":   true,
-	"ssh":    true,
-	"scp":    true,
-	"rsync":  true,
-	"nc":     true,
-	"netcat": true,
-	"telnet": true,
-	"ftp":    true,
-	"sftp":   true,
-	"gh":     true,
-	"aws":    true,
-	"gcloud": true,
-	"az":     true,
-	"twine":  true,
+	"curl":              true,
+	"wget":              true,
+	"invoke-webrequest": true,
+	"iwr":               true,
+	"invoke-restmethod": true,
+	"irm":               true,
+	"bitsadmin":         true,
+	"certutil":          true,
+	"ssh":               true,
+	"scp":               true,
+	"rsync":             true,
+	"nc":                true,
+	"netcat":            true,
+	"telnet":            true,
+	"ftp":               true,
+	"sftp":              true,
+	"gh":                true,
+	"aws":               true,
+	"gcloud":            true,
+	"az":                true,
+	"twine":             true,
+}
+
+// normalizeCommandName extracts the lowercase command basename across both POSIX
+// and Windows path separators and strips common Windows executable extensions.
+func normalizeCommandName(raw string) string {
+	s := strings.TrimSpace(raw)
+	if idx := strings.LastIndexAny(s, `/\`); idx >= 0 {
+		s = s[idx+1:]
+	}
+	s = strings.ToLower(s)
+	for _, ext := range []string{".exe", ".cmd", ".bat", ".com"} {
+		if strings.HasSuffix(s, ext) && len(s) > len(ext) {
+			s = strings.TrimSuffix(s, ext)
+			break
+		}
+	}
+	return s
+}
+
+// extractCommandNameFromSegment preserves Windows backslash paths (such as
+// C:\Windows\System32\icacls.exe or "C:\Program Files\...\rm.exe") that POSIX
+// backslash escaping in splitShellWords would otherwise flatten.
+func extractCommandNameFromSegment(seg, fallbackWord string) string {
+	s := strings.TrimSpace(seg)
+	for s != "" {
+		var tok string
+		if s[0] == '"' || s[0] == '\'' {
+			q := s[0]
+			if end := strings.IndexByte(s[1:], q); end >= 0 {
+				tok = s[1 : 1+end]
+				s = strings.TrimSpace(s[2+end:])
+			} else {
+				break
+			}
+		} else {
+			end := strings.IndexAny(s, " \t")
+			if end < 0 {
+				tok = s
+				s = ""
+			} else {
+				tok = s[:end]
+				s = strings.TrimSpace(s[end:])
+			}
+		}
+		if strings.Contains(tok, "=") || tok == "!" || tok == "time" || tok == "nohup" || tok == "exec" || tok == "command" {
+			continue
+		}
+		if strings.Contains(tok, `\`) {
+			return normalizeCommandName(tok)
+		}
+		break
+	}
+	return normalizeCommandName(fallbackWord)
 }
 
 func isExternalSideEffectCommand(cmdStr string) bool {
@@ -614,7 +812,7 @@ func isExternalSideEffectCommand(cmdStr string) bool {
 	if !ok || len(words) == 0 {
 		return true
 	}
-	cmd := strings.ToLower(filepath.Base(words[0]))
+	cmd := extractCommandNameFromSegment(cmdStr, words[0])
 	if externalSideEffectCommands[cmd] {
 		return true
 	}
@@ -999,7 +1197,7 @@ func isHighRiskCommand(cmdStr string) bool {
 	if !ok || len(words) == 0 {
 		return true
 	}
-	cmd := strings.ToLower(filepath.Base(words[0]))
+	cmd := extractCommandNameFromSegment(cmdStr, words[0])
 	return highRiskCommands[cmd]
 }
 
@@ -1023,7 +1221,7 @@ func isStrictReadOnlyCommand(cmdStr string) bool {
 		return false
 	}
 
-	cmd := strings.ToLower(filepath.Base(words[0]))
+	cmd := extractCommandNameFromSegment(cleaned, words[0])
 	if powerShellWriteCmdlets[cmd] {
 		return false
 	}
@@ -1084,9 +1282,150 @@ func isStrictReadOnlyCommand(cmdStr string) bool {
 		return isAllowedGoArgs(args)
 	case "node", "npm", "pnpm", "yarn", "python", "python3", "rustc", "cargo", "tsc", "oxlint":
 		return len(args) == 1 && (args[0] == "-v" || args[0] == "-V" || args[0] == "--version")
+	case "get-location", "gl":
+		return len(args) == 0
+	case "get-childitem", "gci", "dir":
+		return allPowerShellFlagsAllowed(args, map[string]bool{
+			"-recurse": true, "-name": true, "-force": true, "-file": true,
+			"-directory": true, "-hidden": true, "-readonly": true, "-system": true,
+			"-followsymlink": true,
+		}, map[string]bool{
+			"-path": true, "-literalpath": true, "-filter": true, "-include": true,
+			"-exclude": true, "-depth": true, "-attributes": true,
+		})
+	case "get-content", "gc", "type":
+		// Explicitly excludes -wait so read-only commands never block indefinitely.
+		return allPowerShellFlagsAllowed(args, map[string]bool{
+			"-raw": true, "-readonly": true,
+		}, map[string]bool{
+			"-path": true, "-literalpath": true, "-totalcount": true, "-head": true,
+			"-first": true, "-tail": true, "-last": true, "-encoding": true,
+			"-delimiter": true, "-readcount": true, "-filter": true, "-include": true,
+			"-exclude": true,
+		})
+	case "select-string", "sls":
+		return allPowerShellFlagsAllowed(args, map[string]bool{
+			"-casesensitive": true, "-simplematch": true, "-allmatches": true,
+			"-list": true, "-quiet": true, "-notmatch": true, "-raw": true,
+			"-noemphasis": true,
+		}, map[string]bool{
+			"-pattern": true, "-path": true, "-literalpath": true, "-context": true,
+			"-encoding": true, "-include": true, "-exclude": true, "-culture": true,
+		})
+	case "test-path":
+		return allPowerShellFlagsAllowed(args, map[string]bool{
+			"-isvalid": true,
+		}, map[string]bool{
+			"-path": true, "-literalpath": true, "-pathtype": true, "-filter": true,
+			"-include": true, "-exclude": true, "-newerthan": true, "-olderthan": true,
+		})
+	case "resolve-path", "rvpa":
+		return allPowerShellFlagsAllowed(args, map[string]bool{
+			"-relative": true,
+		}, map[string]bool{
+			"-path": true, "-literalpath": true, "-relativebasepath": true,
+		})
+	case "get-item", "gi", "get-itemproperty", "gp":
+		return allPowerShellFlagsAllowed(args, map[string]bool{
+			"-force": true,
+		}, map[string]bool{
+			"-path": true, "-literalpath": true, "-name": true, "-filter": true,
+			"-include": true, "-exclude": true,
+		})
+	case "where":
+		// Allow Windows where.exe lookups while rejecting PowerShell Where-Object script blocks.
+		return isAllowedWhereArgs(args)
+	case "get-command", "gcm":
+		return allPowerShellFlagsAllowed(args, map[string]bool{
+			"-all": true, "-listimported": true,
+		}, map[string]bool{
+			"-name": true, "-commandtype": true, "-module": true, "-syntax": true,
+		})
+	case "get-date":
+		return allPowerShellFlagsAllowed(args, map[string]bool{
+			"-asutc": true,
+		}, map[string]bool{
+			"-format": true, "-uformat": true,
+		})
+	case "write-output":
+		return allPowerShellFlagsAllowed(args, map[string]bool{
+			"-noenumerate": true,
+		}, map[string]bool{
+			"-inputobject": true,
+		})
 	default:
 		return false
 	}
+}
+
+// allPowerShellFlagsAllowed validates PowerShell cmdlet flags case-insensitively.
+// Rejects script blocks ({...}) and supports -Flag value as well as -Flag:value syntax.
+func allPowerShellFlagsAllowed(args []string, boolFlags map[string]bool, valueFlags map[string]bool) bool {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if strings.ContainsAny(arg, "{}") {
+			return false
+		}
+		if arg == "--" {
+			return true
+		}
+		if !strings.HasPrefix(arg, "-") || arg == "-" {
+			continue
+		}
+		lower := strings.ToLower(arg)
+		if colonIdx := strings.IndexByte(lower, ':'); colonIdx > 0 {
+			flagName := lower[:colonIdx]
+			if boolFlags[flagName] || valueFlags[flagName] {
+				continue
+			}
+			return false
+		}
+		if boolFlags[lower] {
+			continue
+		}
+		if valueFlags[lower] {
+			if i+1 >= len(args) {
+				return false
+			}
+			i++
+			if strings.ContainsAny(args[i], "{}") {
+				return false
+			}
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func isAllowedWhereArgs(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if strings.ContainsAny(arg, "{}") {
+			return false
+		}
+		if strings.HasPrefix(arg, "-") {
+			return false
+		}
+		if strings.HasPrefix(arg, "/") {
+			switch strings.ToLower(arg) {
+			case "/q", "/f", "/t":
+				continue
+			case "/r":
+				if i+1 >= len(args) {
+					return false
+				}
+				i++
+				continue
+			default:
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func isAllowedHeadTailArgs(args []string) bool {

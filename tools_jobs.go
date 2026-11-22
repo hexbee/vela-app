@@ -117,9 +117,10 @@ type backgroundJob struct {
 	cmd         *exec.Cmd
 	stdout      *ringBuffer
 	stderr      *ringBuffer
-	done        chan struct{}
-	sandboxed   bool
-	sandboxMode string
+	done           chan struct{}
+	sandboxed      bool
+	sandboxMode    string
+	sandboxCleanup func()
 
 	createdScratchNow bool
 	beforeSnap        map[string]fileStamp
@@ -173,6 +174,10 @@ func (j *backgroundJob) consumeDelta() (stdoutStr, stderrStr string, dropped boo
 }
 
 func (j *backgroundJob) finish(waitErr error) {
+	if j.sandboxCleanup != nil {
+		j.sandboxCleanup()
+		j.sandboxCleanup = nil
+	}
 	exitCode := 0
 	if waitErr != nil {
 		var exitErr *exec.ExitError
@@ -356,6 +361,10 @@ func (s *ToolService) executeJobOutput(ctx context.Context, req ToolExecuteReque
 	}
 	if job.sandboxed && status != jobStatusRunning && exitCode != 0 && looksLikeSandboxDenial(stderrStr) {
 		out.WriteString(fmt.Sprintf("\n[sandbox: kernel blocked an operation outside allowed roots under %s mode]", job.sandboxMode))
+		if hint := sandboxEscalationHint(job.sandboxMode); hint != "" {
+			out.WriteString("\n")
+			out.WriteString(hint)
+		}
 	}
 
 	meta := map[string]any{
