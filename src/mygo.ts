@@ -457,6 +457,13 @@ export const ToolService = {
   getDefaultApprovalBlacklist(): Promise<string[]> {
     return call("ToolService.GetDefaultApprovalBlacklist");
   },
+  /**
+   * KillAllBackgroundJobs terminates all currently running background bash jobs
+   * across all sessions and waits briefly for their cleanup hooks to complete.
+   */
+  killAllBackgroundJobs(): Promise<void> {
+    return call("ToolService.KillAllBackgroundJobs");
+  },
   /** KillBackgroundJob terminates a running background bash job by ID. */
   killBackgroundJob(jobID: string): Promise<void> {
     return call("ToolService.KillBackgroundJob", jobID);
