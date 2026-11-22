@@ -1,6 +1,6 @@
 {
   "name": "vela",
-  "version": "0.3.5",
+  "version": "0.3.6",
   "description": "船帆座 · Vela — 基于 MyGo 构建的轻量级跨平台原生多模型 AI 桌面工作台",
   "packageManager": "pnpm@12.14.0",
   "license": "MIT",
