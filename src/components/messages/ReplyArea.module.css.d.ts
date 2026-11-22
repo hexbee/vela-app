@@ -5,9 +5,23 @@ declare const styles: {
   readonly stoppedIcon: string
   readonly titleText: string
   readonly shimmer: string
+  readonly steps: string
+  readonly stepsContent: string
+  readonly fadeTop: string
+  readonly fadeBottom: string
   readonly withLine: string
   readonly content: string
   readonly lastItem: string
+  readonly thinkRow: string
+  readonly thinkRowExpanded: string
+  readonly thinkHeader: string
+  readonly thinkLabel: string
+  readonly thinkSeparator: string
+  readonly thinkSummary: string
+  readonly thinkSummaryText: string
+  readonly thinkSummaryStreaming: string
+  readonly thinkChevron: string
+  readonly thinkBody: string
   readonly dot: string
   readonly dotInner: string
   readonly pulse: string

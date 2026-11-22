@@ -56,6 +56,36 @@
   }
 }
 
+.steps {
+  max-height: min(400px, 50vh);
+  overflow-y: auto;
+  overscroll-behavior-y: auto;
+  scrollbar-gutter: stable;
+}
+
+.stepsContent {
+  display: flex;
+  flex-direction: column;
+}
+
+.fadeTop {
+  mask-image: linear-gradient(to bottom, transparent 0, #000 24px, #000 100%);
+}
+
+.fadeBottom {
+  mask-image: linear-gradient(to bottom, #000 0, #000 calc(100% - 24px), transparent 100%);
+}
+
+.fadeTop.fadeBottom {
+  mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    #000 24px,
+    #000 calc(100% - 24px),
+    transparent 100%
+  );
+}
+
 .withLine,
 .content {
   &::after {
@@ -82,9 +112,111 @@
   }
 }
 
+.thinkRow {
+  position: relative;
+  padding: 2px 0 2px 22px;
+
+  &::after {
+    content: '';
+    position: absolute;
+    left: 7.5px;
+    top: 24px;
+    width: 1px;
+    height: calc(100% - 18px);
+    background-color: var(--dsw-alias-label-dimmed);
+  }
+
+  &.lastItem::after {
+    display: none;
+  }
+
+  &.thinkRowExpanded.lastItem::after {
+    display: block;
+    height: calc(100% - 28px);
+  }
+}
+
+.thinkHeader {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-width: 0;
+  height: 26px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--dsw-alias-label-tertiary);
+  font: var(--dsw-font-markdown-small);
+  text-align: left;
+  cursor: pointer;
+  user-select: none;
+  transition: color 0.15s;
+
+  &:hover {
+    color: var(--dsw-alias-label-secondary);
+  }
+}
+
+.thinkRowExpanded > .thinkHeader {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background-color: var(--dsw-alias-bg-base);
+}
+
+.thinkLabel {
+  flex-shrink: 0;
+  font-weight: 400;
+}
+
+.thinkSeparator {
+  flex: none;
+  width: 2px;
+  height: 2px;
+  margin: 0 7px;
+  border-radius: 1px;
+  background-color: var(--dsw-alias-label-caption);
+}
+
+.thinkSummary {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  white-space: nowrap;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.thinkSummaryText {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.thinkSummaryStreaming {
+  mask-image: linear-gradient(to right, #000 calc(100% - 48px), transparent);
+
+  .thinkSummaryText {
+    overflow: visible;
+    text-overflow: clip;
+  }
+}
+
+.thinkChevron {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  margin-left: 6px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.thinkBody {
+  padding: 2px 0 4px;
+  min-width: 0;
+}
+
 .dot {
   position: absolute;
-  top: 9px;
+  top: 7px;
   left: 0;
   display: inline-flex;
   align-items: center;
