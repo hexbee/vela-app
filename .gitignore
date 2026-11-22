@@ -11,3 +11,4 @@ build/
 !.env.example
 tmp/
 mygo-update.key
+.workbuddy/
