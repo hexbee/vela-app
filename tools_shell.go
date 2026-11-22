@@ -205,7 +205,8 @@ func (s *ToolService) executeBash(ctx context.Context, req ToolExecuteRequest) (
 	cmd.Stderr = stderrBuf
 
 	startedAt := time.Now()
-	if err := cmd.Start(); err != nil {
+	releaseJob, err := startCommandWithProcessTree(cmd)
+	if err != nil {
 		if cleanupSandbox != nil {
 			cleanupSandbox()
 		}
@@ -214,7 +215,6 @@ func (s *ToolService) executeBash(ctx context.Context, req ToolExecuteRequest) (
 		}
 		return toolErrorResult(fmt.Sprintf("Error starting command: %v", err), reqWorkdir)
 	}
-	releaseJob := attachProcessTree(cmd)
 	cleanupAll := func() {
 		if releaseJob != nil {
 			releaseJob()

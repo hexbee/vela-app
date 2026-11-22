@@ -271,8 +271,9 @@ func main() {
 		go globalMCPService.Start()
 	})
 
-	defer globalMCPService.StopAll()
 	defer releaseAllSandboxTemps()
+	defer globalToolService.KillAllBackgroundJobs()
+	defer globalMCPService.StopAll()
 	if err := mygo.App.Run(); err != nil {
 		log.Fatal(err)
 	}

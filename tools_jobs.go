@@ -279,6 +279,37 @@ func (s *ToolService) KillBackgroundJob(jobID string) error {
 	return nil
 }
 
+// KillAllBackgroundJobs terminates all currently running background bash jobs
+// across all sessions and waits briefly for their cleanup hooks to complete.
+func (s *ToolService) KillAllBackgroundJobs() {
+	s.mu.Lock()
+	running := make([]*backgroundJob, 0, len(s.jobs))
+	for _, j := range s.jobs {
+		j.mu.Lock()
+		isRunning := j.status == jobStatusRunning
+		j.mu.Unlock()
+		if isRunning {
+			running = append(running, j)
+		}
+	}
+	s.mu.Unlock()
+
+	for _, j := range running {
+		j.kill()
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for _, j := range running {
+		rem := time.Until(deadline)
+		if rem <= 0 {
+			break
+		}
+		select {
+		case <-j.done:
+		case <-time.After(rem):
+		}
+	}
+}
+
 func (s *ToolService) executeJobOutput(ctx context.Context, req ToolExecuteRequest) (ToolExecuteResult, error) {
 	jobID := strings.TrimSpace(stringInput(req.Input, "job_id"))
 	if jobID == "" {

@@ -6,8 +6,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"testing"
+	"time"
 )
 
 func TestWindowsConfigureProcessGroupRestrictedTokenClearsCreateNoWindow(t *testing.T) {
@@ -121,4 +124,57 @@ func TestWindowsSessionTempReuseAndJobObject(t *testing.T) {
 	if cleanErr2 != nil || cleanedAgain {
 		t.Fatalf("expected second CleanupWorkspaceSandboxACL to be a no-op, cleaned=%v err=%v", cleanedAgain, cleanErr2)
 	}
+}
+
+func TestWindowsProcessTreeKillTerminatesDescendants(t *testing.T) {
+	wsDir := t.TempDir()
+	pidFile := filepath.Join(wsDir, "child.pid")
+	script := "$p = Start-Process -FilePath powershell.exe -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 60' -PassThru -WindowStyle Hidden; Set-Content -Path '" + pidFile + "' -Value $p.Id; Start-Sleep -Seconds 60"
+	cmd := buildShellCommand(script)
+	cmd.Dir = wsDir
+
+	releaseJob, err := startCommandWithProcessTree(cmd)
+	if err != nil {
+		t.Fatalf("startCommandWithProcessTree failed: %v", err)
+	}
+	defer func() {
+		if releaseJob != nil {
+			releaseJob()
+		}
+	}()
+
+	var childPID int
+	for i := 0; i < 40; i++ {
+		if data, rErr := os.ReadFile(pidFile); rErr == nil {
+			if n, pErr := strconv.Atoi(strings.TrimSpace(string(data))); pErr == nil && n > 0 {
+				childPID = n
+				break
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if childPID == 0 {
+		killProcessTree(cmd)
+		_ = cmd.Wait()
+		t.Fatalf("timed out waiting for child process PID file")
+	}
+
+	killProcessTree(cmd)
+	_ = cmd.Wait()
+
+	// Verify the spawned child process is also gone.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		h, openErr := syscall.OpenProcess(syscall.SYNCHRONIZE, false, uint32(childPID))
+		if openErr != nil {
+			return // process handle no longer exists -> killed
+		}
+		waitRes, _ := syscall.WaitForSingleObject(h, 0)
+		_ = syscall.CloseHandle(h)
+		if waitRes == syscall.WAIT_OBJECT_0 {
+			return // signaled -> exited
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("child process %d survived killProcessTree", childPID)
 }
