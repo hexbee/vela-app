@@ -5,18 +5,33 @@ package main
 import (
 	"os/exec"
 	"strconv"
+	"syscall"
 )
+
+// createNoWindow is the Win32 CREATE_NO_WINDOW process creation flag.
+// Combined with HideWindow, it prevents GUI-launched apps from spawning
+// visible console windows for PowerShell, MCP stdio servers, and taskkill.
+const createNoWindow uint32 = 0x08000000
 
 func buildShellCommand(command string) *exec.Cmd {
 	shell := "pwsh"
 	if _, err := exec.LookPath(shell); err != nil {
 		shell = "powershell.exe"
 	}
-	return exec.Command(shell, "-NoProfile", "-NonInteractive", "-Command", command)
+	cmd := exec.Command(shell, "-NoProfile", "-NonInteractive", "-Command", command)
+	configureProcessGroup(cmd)
+	return cmd
 }
 
-func configureProcessGroup(_ *exec.Cmd) {
-	// Process tree termination on Windows is handled via taskkill /T /F.
+func configureProcessGroup(cmd *exec.Cmd) {
+	if cmd == nil {
+		return
+	}
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.HideWindow = true
+	cmd.SysProcAttr.CreationFlags |= createNoWindow
 }
 
 func killProcessTree(cmd *exec.Cmd) {
@@ -27,5 +42,7 @@ func killProcessTree(cmd *exec.Cmd) {
 	if pid <= 0 {
 		return
 	}
-	_ = exec.Command("taskkill", "/T", "/F", "/PID", strconv.Itoa(pid)).Run()
+	killCmd := exec.Command("taskkill", "/T", "/F", "/PID", strconv.Itoa(pid))
+	configureProcessGroup(killCmd)
+	_ = killCmd.Run()
 }

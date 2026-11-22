@@ -196,7 +196,7 @@ func TestSandboxProfileAndMacOSSeatbelt(t *testing.T) {
 
 	// 3. When Seatbelt is permitted in the current host environment (non-nested),
 	// verify live kernel enforcement blocks writes outside writableRoots.
-	if !isSeatbeltAvailable() {
+	if !isOSSandboxAvailable() {
 		t.Log("seatbelt unavailable in nested sandbox environment; verified profile generation and graceful fallback")
 		return
 	}
