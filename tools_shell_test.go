@@ -286,3 +286,50 @@ func TestBashScratchCleanupAndSnapshotDiff(t *testing.T) {
 		t.Fatalf("expected only newly created second.txt (no duplicate first.txt), got %#v", produced3)
 	}
 }
+
+func TestBashSnapshotSkipsVenvAndCapsProducedFiles(t *testing.T) {
+	ts := &ToolService{}
+	wsDir, _ := setupTestWorkspace(t)
+
+	// 1. Creating .venv, __pycache__, and a custom-named venv (with pyvenv.cfg) should not flood producedFiles,
+	// while regular project files created in the same command are still reported.
+	cmd := strings.Join([]string{
+		"mkdir -p .venv/lib/python3.12/site-packages/pkg __pycache__ custom_env/lib",
+		"echo 'home = /usr/bin' > .venv/pyvenv.cfg",
+		"echo 'x = 1' > .venv/lib/python3.12/site-packages/pkg/mod.py",
+		"echo 'bytecode' > __pycache__/app.cpython-312.pyc",
+		"echo 'home = /usr/bin' > custom_env/pyvenv.cfg",
+		"echo 'y = 2' > custom_env/lib/site.py",
+		"echo 'print(1)' > app.py",
+	}, " && ")
+
+	res, err := ts.ExecuteTool(ToolExecuteRequest{
+		SessionID:      "venv-filter-1",
+		ToolName:       "bash",
+		Workdir:        wsDir,
+		PermissionMode: PermissionWorkspaceWrite,
+		Approved:       true,
+		Input:          map[string]any{"command": cmd},
+	})
+	if err != nil || res.IsError {
+		t.Fatalf("venv creation command failed: err=%v res=%#v", err, res)
+	}
+	produced, _ := res.UIMeta["producedFiles"].([]string)
+	if len(produced) != 1 || filepath.Base(produced[0]) != "app.py" {
+		t.Fatalf("expected only [app.py] in producedFiles, got %#v", produced)
+	}
+
+	// 2. diffSnapshots caps output at maxProducedFilesPerCommand when many regular files change.
+	before := map[string]fileStamp{}
+	after := make(map[string]fileStamp, maxProducedFilesPerCommand+25)
+	for i := 0; i < maxProducedFilesPerCommand+25; i++ {
+		after[filepath.Join("gen", strings.Repeat("a", 2)+string(rune('0'+i/10))+string(rune('0'+i%10))+".txt")] = fileStamp{
+			size:        10,
+			modTimeNano: int64(i + 1),
+		}
+	}
+	capped := diffSnapshots(wsDir, before, after)
+	if len(capped) != maxProducedFilesPerCommand {
+		t.Fatalf("expected diffSnapshots to cap at %d files, got %d", maxProducedFilesPerCommand, len(capped))
+	}
+}

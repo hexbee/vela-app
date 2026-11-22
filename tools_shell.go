@@ -15,9 +15,10 @@ import (
 )
 
 const (
-	bashDefaultTimeoutMs = 60_000
-	bashMaxTimeoutMs     = 300_000
-	bashMaxOutputBytes   = 64 * 1024
+	bashDefaultTimeoutMs       = 60_000
+	bashMaxTimeoutMs           = 300_000
+	bashMaxOutputBytes         = 64 * 1024
+	maxProducedFilesPerCommand = 50
 )
 
 var sensitiveEnvPattern = regexp.MustCompile(`(?i)(KEY|PASSWORD|SECRET|TOKEN)`)
@@ -49,17 +50,24 @@ func snapshotDirFiles(dir string) map[string]fileStamp {
 	if dir == "" {
 		return snap
 	}
+	gitignore := newGitignoreMatcher(dir)
 	_ = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
 		if d.IsDir() {
-			if path != dir && skippedDirs[d.Name()] {
-				return filepath.SkipDir
+			if path != dir {
+				if shouldSkipDir(path, d.Name()) || gitignore.isIgnored(path, true) {
+					return filepath.SkipDir
+				}
 			}
+			gitignore.loadDir(path)
 			return nil
 		}
 		if d.Type()&os.ModeSymlink != 0 {
+			return nil
+		}
+		if gitignore.isIgnored(path, false) {
 			return nil
 		}
 		rel, rErr := filepath.Rel(dir, path)
@@ -86,6 +94,9 @@ func diffSnapshots(dir string, before, after map[string]fileStamp) []string {
 		}
 	}
 	sort.Strings(changed)
+	if len(changed) > maxProducedFilesPerCommand {
+		changed = changed[:maxProducedFilesPerCommand]
+	}
 	return changed
 }
 

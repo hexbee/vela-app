@@ -31,9 +31,35 @@ const (
 )
 
 var skippedDirs = map[string]bool{
-	".git":         true,
-	"node_modules": true,
-	trashDirName:   true,
+	".git":          true,
+	"node_modules":  true,
+	trashDirName:    true,
+	".venv":         true,
+	"venv":          true,
+	"__pycache__":   true,
+	".pytest_cache": true,
+	".mypy_cache":   true,
+	".ruff_cache":   true,
+	".tox":          true,
+	".nox":          true,
+	".gradle":       true,
+	".next":         true,
+	".nuxt":         true,
+	".turbo":        true,
+	".cache":        true,
+}
+
+// shouldSkipDir reports whether a subdirectory should be skipped during workspace walks
+// (glob, grep, and bash file-change snapshots). Besides well-known dependency/cache directories,
+// it also detects custom-named Python virtual environments via their pyvenv.cfg marker.
+func shouldSkipDir(dirPath, name string) bool {
+	if skippedDirs[name] {
+		return true
+	}
+	if _, err := os.Stat(filepath.Join(dirPath, "pyvenv.cfg")); err == nil {
+		return true
+	}
+	return false
 }
 
 func toolErrorResult(msg string, workdir string) (ToolExecuteResult, error) {
@@ -452,6 +478,12 @@ func executeGlob(ctx context.Context, req ToolExecuteRequest) (ToolExecuteResult
 	normPattern := filepath.ToSlash(strings.TrimPrefix(pattern, "./"))
 	var matches []globEntry
 
+	gitignore := newGitignoreMatcher(searchRoot)
+	if rawBase != "" && gitignore.isIgnored(searchRoot, true) {
+		// When the caller explicitly targets an ignored directory, allow searching inside it.
+		gitignore = nil
+	}
+
 	walkErr := filepath.WalkDir(searchRoot, func(path string, d fs.DirEntry, wErr error) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -460,9 +492,15 @@ func executeGlob(ctx context.Context, req ToolExecuteRequest) (ToolExecuteResult
 			return nil
 		}
 		if d.IsDir() {
-			if path != searchRoot && skippedDirs[d.Name()] {
-				return filepath.SkipDir
+			if path != searchRoot {
+				if shouldSkipDir(path, d.Name()) || gitignore.isIgnored(path, true) {
+					return filepath.SkipDir
+				}
 			}
+			gitignore.loadDir(path)
+			return nil
+		}
+		if gitignore.isIgnored(path, false) {
 			return nil
 		}
 		rel, rErr := filepath.Rel(searchRoot, path)
@@ -649,6 +687,11 @@ func executeGrep(ctx context.Context, req ToolExecuteRequest) (ToolExecuteResult
 		}
 		_ = scanFile(searchTarget, display)
 	} else {
+		gitignore := newGitignoreMatcher(searchTarget)
+		if rawBase != "" && gitignore.isIgnored(searchTarget, true) {
+			// When the caller explicitly targets an ignored directory, allow searching inside it.
+			gitignore = nil
+		}
 		walkErr := filepath.WalkDir(searchTarget, func(path string, d fs.DirEntry, wErr error) error {
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -657,13 +700,19 @@ func executeGrep(ctx context.Context, req ToolExecuteRequest) (ToolExecuteResult
 				return nil
 			}
 			if d.IsDir() {
-				if path != searchTarget && skippedDirs[d.Name()] {
-					return filepath.SkipDir
+				if path != searchTarget {
+					if shouldSkipDir(path, d.Name()) || gitignore.isIgnored(path, true) {
+						return filepath.SkipDir
+					}
 				}
+				gitignore.loadDir(path)
 				return nil
 			}
 			// Skip symlinks during recursive walk.
 			if d.Type()&os.ModeSymlink != 0 {
+				return nil
+			}
+			if gitignore.isIgnored(path, false) {
 				return nil
 			}
 			rel, rErr := filepath.Rel(searchTarget, path)
