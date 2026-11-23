@@ -1,11 +1,12 @@
 import { ToolService, type ToolExecuteRequest } from '../../mygo.js'
 import type { ClientToolDefinition } from '../api/types.js'
+import { cleanupForegroundJob, registerBackgroundJobMeta } from '../jobs/store.js'
 import { isMCPReadOnlyTool, markSessionMCPToolsLoaded } from '../mcp/store.js'
 import { useSettings } from '../settings.js'
 import type { PermissionMode } from '../workspace/types.js'
 import type { ClientToolResultPart, ClientToolUsePart, ToolFileDiff, ToolUIMeta } from './types.js'
 
-const READ_ONLY_TOOLS = new Set(['read', 'glob', 'grep', 'job_output', 'skill'])
+const READ_ONLY_TOOLS = new Set(['read', 'glob', 'grep', 'job_output', 'job_list', 'skill'])
 const READ_CONCURRENCY_LIMIT = 4
 
 const isReadOnlyToolName = (name: string): boolean =>
@@ -143,7 +144,7 @@ export const CLIENT_FILE_TOOLS: ClientToolDefinition[] = [
   {
     name: 'bash',
     description:
-      'Execute a shell command (bash on macOS/Linux, PowerShell on Windows) in the active workspace or isolated temporary directory. Strict read-only commands run automatically; write/build/test commands run inside the OS sandbox (or request approval when needed). If the sandbox blocks an operation ([sandbox: ...]), you may retry that exact command once with sandbox_permissions (the narrowest wider mode that suffices) and a one-sentence justification to ask the user for one-time approval. Non-zero exit codes are returned as normal output with [exit code: N]. Commands running past timeoutMs are automatically moved to a background job so you can inspect them with job_output or stop them with job_kill. Prefer delete_file over rm.',
+      'Execute a shell command (bash on macOS/Linux, PowerShell on Windows) in the active workspace or isolated temporary directory. Strict read-only commands run automatically; write/build/test commands run inside the OS sandbox (or request approval when needed). If the sandbox blocks an operation ([sandbox: ...]), you may retry that exact command once with sandbox_permissions (the narrowest wider mode that suffices) and a one-sentence justification to ask the user for one-time approval. Non-zero exit codes are returned as normal output with [exit code: N]. For long-running commands such as dev servers, watchers, or large downloads, set run_in_background: true to return a job ID immediately instead of blocking. Foreground commands running past timeoutMs are also automatically moved to a background job so you can inspect them with job_output, list them with job_list, or stop them with job_kill. Prefer delete_file over rm.',
     input_schema: {
       type: 'object',
       properties: {
@@ -162,7 +163,13 @@ export const CLIENT_FILE_TOOLS: ClientToolDefinition[] = [
         },
         timeoutMs: {
           type: 'integer',
-          description: 'Optional timeout in milliseconds (default 60000, max 300000).',
+          description:
+            'Optional foreground wait timeout in milliseconds (default 60000, max 300000). Ignored when run_in_background is true.',
+        },
+        run_in_background: {
+          type: 'boolean',
+          description:
+            'Run the command in the background and return a job ID immediately without waiting or timing out (use for servers, watchers, and long downloads).',
         },
         sandbox_permissions: {
           type: 'string',
@@ -182,7 +189,7 @@ export const CLIENT_FILE_TOOLS: ClientToolDefinition[] = [
   {
     name: 'job_output',
     description:
-      'Read new stdout/stderr output and current status (running/completed/killed) from a background bash job created when a command exceeded timeoutMs.',
+      'Read new stdout/stderr output and current status (running/completed/killed) from a background bash job (started with run_in_background, moved to background by the user, or promoted after timeoutMs).',
     input_schema: {
       type: 'object',
       properties: {
@@ -193,10 +200,19 @@ export const CLIENT_FILE_TOOLS: ClientToolDefinition[] = [
         wait_ms: {
           type: 'integer',
           description:
-            'Optional milliseconds to wait for new output or completion (default 0, max 30000).',
+            'Optional milliseconds to wait for the job to finish before returning (default 0 returns immediately, max 30000).',
         },
       },
       required: ['job_id'],
+    },
+  },
+  {
+    name: 'job_list',
+    description:
+      'List background bash jobs (running, completed, or killed) in the current session with their IDs, statuses, and descriptions.',
+    input_schema: {
+      type: 'object',
+      properties: {},
     },
   },
   {
@@ -237,6 +253,7 @@ export type AgentWorkspaceContext = {
   skillsReminder?: string
   invokedSkillReminder?: string
   mcpPromptSection?: string
+  settledJobsReminder?: string
 }
 
 /** 组装包含工作区状态、权限边界、Skills 渐进式摘要与 MCP 指令/按需目录的系统提示，避免普通闲聊误触磁盘探测 */
@@ -254,7 +271,7 @@ export const buildAgentSystemPrompt = (basePrompt: string, ctx: AgentWorkspaceCo
     parts.push(
       `当前已挂载本地工作区：${ctx.workspacePath}。`,
       permissionNote,
-      '你可以使用内置工具（read、write、edit、delete_file、glob、grep、bash、job_output、job_kill、skill）查看代码、修改文件与运行命令；优先使用相对路径，删除文件优先使用 delete_file 而非 rm。'
+      '你可以使用内置工具（read、write、edit、delete_file、glob、grep、bash、job_output、job_list、job_kill、skill）查看代码、修改文件与运行命令；优先使用相对路径，删除文件优先使用 delete_file 而非 rm。'
     )
   } else if (ctx.scratchDir) {
     parts.push(
@@ -270,6 +287,10 @@ export const buildAgentSystemPrompt = (basePrompt: string, ctx: AgentWorkspaceCo
     )
   }
 
+  parts.push(
+    '后台命令规范：启动常驻服务或无终点进程（如 dev server、http.server、watch）时，请给 bash 传入 run_in_background: true 立即返回；普通安装依赖、编译或中等耗时下载请优先前台运行（界面会实时流式展示输出并允许用户随时手动转后台）；如果用户手动将命令转入后台（返回 moved to background by user），必须立刻结束等待并直接回复用户，绝不要在本轮继续调用 job_output 轮询。'
+  )
+
   if (ctx.skillsReminder) {
     parts.push(ctx.skillsReminder)
   }
@@ -278,6 +299,9 @@ export const buildAgentSystemPrompt = (basePrompt: string, ctx: AgentWorkspaceCo
   }
   if (ctx.mcpPromptSection) {
     parts.push(ctx.mcpPromptSection)
+  }
+  if (ctx.settledJobsReminder) {
+    parts.push(ctx.settledJobsReminder)
   }
 
   return parts.join('\n')
@@ -406,6 +430,7 @@ const runSingleTool = async (
   const settings = useSettings.getState()
   const req: ToolExecuteRequest = {
     sessionId: ctx.sessionId,
+    toolUseId: call.id,
     toolName: call.name,
     input: call.input,
     workdir,
@@ -488,6 +513,23 @@ const runSingleTool = async (
       ctx.onAssignedScratch(res.assignedScratch)
     }
     const uiMeta = parseToolUIMeta(res.uiMeta) ?? {}
+    if (call.name === 'bash') {
+      if (uiMeta.backgroundJobId) {
+        const cmd = typeof call.input.command === 'string' ? call.input.command : undefined
+        const desc = typeof call.input.description === 'string' ? call.input.description : undefined
+        registerBackgroundJobMeta({
+          jobId: uiMeta.backgroundJobId,
+          sessionId: ctx.sessionId,
+          toolUseId: call.id,
+          command: cmd,
+          description: desc,
+          status: uiMeta.jobStatus,
+          exitCode: typeof uiMeta.exitCode === 'number' ? uiMeta.exitCode : undefined,
+        })
+      } else {
+        cleanupForegroundJob(call.id)
+      }
+    }
     if (!res.isError && uiMeta.mcpServer && uiMeta.mcpLoadedTools?.length) {
       markSessionMCPToolsLoaded(ctx.sessionId, uiMeta.mcpServer, uiMeta.mcpLoadedTools)
     }

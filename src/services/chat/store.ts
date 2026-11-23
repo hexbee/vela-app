@@ -14,6 +14,11 @@ import {
 } from '../workspace/store.js'
 import type { PermissionMode } from '../workspace/types.js'
 import {
+  acknowledgeSettledJobNotices,
+  clearSessionJobs,
+  peekSettledJobNoticesPrompt,
+} from '../jobs/store.js'
+import {
   buildMCPSystemPromptSection,
   clearSessionMCPTools,
   getActiveMCPToolsForSession,
@@ -720,7 +725,9 @@ const removeSessionData = async (
     }
     await db.deleteSession(id)
     clearSessionMCPTools(id)
+    clearSessionJobs(id)
     void ToolService.clearSessionApprovals(id).catch(() => {})
+    await ToolService.killSessionBackgroundJobs(id).catch(() => {})
     if (hasScratch && options?.removeScratchDir) {
       await WorkspaceService.removeScratchDir(id).catch(() => {})
     }
@@ -842,6 +849,44 @@ export const sendMessage = (targetSessionId: string | null) => {
   }
   persist(sessionId)
   clearSentDraft(targetSessionId)
+  void streamReply(sessionId, reply, { history, question })
+  return true
+}
+
+/**
+ * 直接向已有会话发送一条纯文本快捷消息（不改动或清空输入框草稿），
+ * 供后台任务完成后一键「继续处理」使用。
+ */
+export const sendQuickMessage = (sessionId: string, rawText: string): boolean => {
+  const text = rawText.trim()
+  if (
+    !text ||
+    get().importingHistory ||
+    !get().ready ||
+    deletingSessions.has(sessionId) ||
+    getStreamController(sessionId)
+  ) {
+    return false
+  }
+  const current = getSession(sessionId)
+  if (!current) {
+    return false
+  }
+  const now = Date.now()
+  const history = getVisibleMessages(current)
+  const question: UserMessage = {
+    id: createId(),
+    role: 'user',
+    content: text,
+    files: [],
+    createdAt: now,
+  }
+  const reply = createReply()
+  updateSession(sessionId, (session) => ({
+    ...appendBranch(session, history.at(-1)?.id ?? null, [question, reply]),
+    updatedAt: now,
+  }))
+  persist(sessionId)
   void streamReply(sessionId, reply, { history, question })
   return true
 }
@@ -1250,6 +1295,8 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
           resolveExplicitSkillReminder(prepared.question.content, initialWorkdir),
         ])
         const skillsReminder = buildSkillCatalogReminder(skillCatalog)
+        const settledJobs = peekSettledJobNoticesPrompt(sessionId)
+        let pendingAckJobIds = settledJobs?.jobIds ?? []
 
         for (let step = 0; step < MAX_AGENT_STEPS; step += 1) {
           const messages = toRequestMessages(
@@ -1265,6 +1312,7 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
             skillsReminder,
             invokedSkillReminder,
             mcpPromptSection: buildMCPSystemPromptSection(),
+            settledJobsReminder: settledJobs?.prompt,
           }
           const events = streamMessage(
             useSettings.getState().apiKey ?? '',
@@ -1282,7 +1330,13 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
           )
           const blockIndexes = new Map<number, number>()
           for await (const event of events) {
-            receivedContent ||= event.type === 'content_block_start'
+            if (event.type === 'content_block_start') {
+              receivedContent = true
+              if (pendingAckJobIds.length > 0) {
+                acknowledgeSettledJobNotices(sessionId, pendingAckJobIds)
+                pendingAckJobIds = []
+              }
+            }
             if (
               event.type === 'message_delta' &&
               (event.delta.stop_reason === 'end_turn' ||
@@ -1315,6 +1369,7 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
             !controller.signal.aborted &&
             step + 1 < MAX_AGENT_STEPS
           ) {
+            const baseBlocks = reply.blocks
             const toolResults = await executeClientToolCalls(unsettled, {
               sessionId,
               getWorkdir: () => getSessionWorkdir(sessionId),
@@ -1336,11 +1391,18 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
                 )
                 persist(sessionId)
               },
+              onResult: (result) => {
+                reply = {
+                  ...reply,
+                  blocks: [...reply.blocks, result],
+                }
+                flush()
+              },
             })
             reply = {
               ...reply,
               stopReason: undefined,
-              blocks: [...reply.blocks, ...toolResults],
+              blocks: [...baseBlocks, ...toolResults],
             }
             flush()
             persist(sessionId)

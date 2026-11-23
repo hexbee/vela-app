@@ -25,6 +25,8 @@ type ToolService struct {
 	nextJobID     uint64
 	jobs          map[string]*backgroundJob
 	sessionAllows map[string]map[string]bool
+	emitOutputFn  func(JobOutputDelta)
+	emitSettledFn func(JobSettledNotice)
 }
 
 var globalToolService = &ToolService{
@@ -50,7 +52,8 @@ type ToolFileDiff struct {
 // ToolExecuteRequest is the unified RPC payload for classifying and executing a client tool.
 type ToolExecuteRequest struct {
 	SessionID         string         `json:"sessionId"`
-	ToolName          string         `json:"toolName"` // read | write | edit | delete_file | glob | grep | bash | job_output | job_kill | skill
+	ToolUseID         string         `json:"toolUseId,omitempty"` // Optional client tool_use block ID for correlating live stream & promote actions
+	ToolName          string         `json:"toolName"`            // read | write | edit | delete_file | glob | grep | bash | job_output | job_list | job_kill | skill
 	Input             map[string]any `json:"input"`
 	Workdir           string         `json:"workdir"`                     // User workspace or existing scratchDir; empty triggers lazy scratch on write/edit/bash
 	PermissionMode    string         `json:"permissionMode"`              // read-only | workspace-write | full-access
@@ -163,7 +166,7 @@ func (s *ToolService) ClassifyToolCall(req ToolExecuteRequest) ToolClassifyResul
 		}
 		return res
 	}
-	if req.ToolName == "job_output" || req.ToolName == "job_kill" || req.ToolName == "skill" {
+	if req.ToolName == "job_output" || req.ToolName == "job_list" || req.ToolName == "job_kill" || req.ToolName == "skill" {
 		return ToolClassifyResult{Decision: DecisionAllow}
 	}
 	if strings.HasPrefix(req.ToolName, "mcp__") {
@@ -237,6 +240,8 @@ func (s *ToolService) ExecuteTool(req ToolExecuteRequest) (ToolExecuteResult, er
 		return s.executeBash(ctx, req)
 	case "job_output":
 		return s.executeJobOutput(ctx, req)
+	case "job_list":
+		return s.executeJobList(req)
 	case "job_kill":
 		return s.executeJobKill(req)
 	case "skill":

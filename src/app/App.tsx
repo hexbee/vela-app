@@ -1,6 +1,7 @@
 import { useEffect } from 'react'
 import { useTranslate } from '../i18n/index.js'
 import { useSettings } from '../services/settings.js'
+import { initJobEvents, onJobSettled } from '../services/jobs/store.js'
 import { initMCP } from '../services/mcp/store.js'
 import { initWorkspaces } from '../services/workspace/store.js'
 import { useIsMobile, useMobileViewport, usePreventPageScroll } from './viewport.js'
@@ -65,6 +66,34 @@ export const App = () => {
 
   // 文件数、存储空间达到上限时，附件上只显示「上传失败」，原因用 toast 说明
   useEffect(() => onUploadNotice(showToast), [])
+  // 后台命令自然完成或异常退出时弹出 Toast 提醒（窗口在后台时补充桌面通知）
+  useEffect(
+    () =>
+      onJobSettled((notice) => {
+        if (notice.status !== 'completed') {
+          return
+        }
+        const rawLabel = notice.description?.trim() || notice.command
+        const label = rawLabel.length > 36 ? `${rawLabel.slice(0, 36)}…` : rawLabel
+        const text =
+          notice.exitCode !== 0
+            ? t('toolJobFailedToast', { id: notice.jobId, label, code: notice.exitCode })
+            : t('toolJobCompletedToast', { id: notice.jobId, label })
+        showToast(text)
+        if (
+          document.visibilityState === 'hidden' &&
+          typeof Notification !== 'undefined' &&
+          Notification.permission === 'granted'
+        ) {
+          try {
+            new Notification(t('appName'), { body: text })
+          } catch {
+            // 忽略桌面通知权限或环境异常
+          }
+        }
+      }),
+    [t]
+  )
   useEffect(bindChatPersistence, [])
 
   // 搜索结果面板只属于当前会话
@@ -78,6 +107,7 @@ export const App = () => {
     void initChat()
     void initWorkspaces()
     void initMCP()
+    initJobEvents()
     // 首次打开先在设置里输入 API Key
     ensureApiKey()
   }, [])

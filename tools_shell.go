@@ -2,16 +2,15 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -108,17 +107,25 @@ func isDirEmpty(dir string) bool {
 	return len(entries) == 0
 }
 
+// truncateOutput retains the tail of s up to maxBytes on a valid UTF-8 boundary,
+// preserving trailing progress lines, listening URLs, and error diagnostics.
 func truncateOutput(s string, maxBytes int) (string, bool) {
-	if len(s) <= maxBytes {
+	if maxBytes <= 0 || len(s) <= maxBytes {
 		return s, false
 	}
-	return s[:maxBytes], true
+	start := len(s) - maxBytes
+	for start < len(s) && !utf8.RuneStart(s[start]) {
+		start++
+	}
+	return s[start:], true
 }
 
-// executeBash implements bash(description?, command, workdir?, timeoutMs?) with:
+// executeBash implements bash(description?, command, workdir?, timeoutMs?, run_in_background?) with:
+//   - job-first registration so live stdout/stderr stream immediately and users can detach to background on demand
+//   - explicit run_in_background=true support for immediate non-blocking starts (servers, long downloads)
 //   - process-group isolation and full subtree cleanup on user cancel
-//   - lightweight OS sandbox (macOS sandbox-exec / Linux bwrap) for read-only & workspace-write
-//   - automatic promotion to a background job on timeout (with ring buffers & job_output/job_kill)
+//   - lightweight OS sandbox (macOS sandbox-exec / Linux bwrap / Windows AppContainer) for read-only & workspace-write
+//   - automatic promotion to a background job on timeout (with ring buffers & job_output/job_list/job_kill)
 //   - sensitive environment variable stripping
 //   - lazy scratch dir creation with post-exit empty-dir cleanup
 //   - before/after file snapshot diff for uiMeta.producedFiles
@@ -130,6 +137,7 @@ func (s *ToolService) executeBash(ctx context.Context, req ToolExecuteRequest) (
 	}
 
 	description := strings.TrimSpace(stringInput(req.Input, "description"))
+	runInBackground := boolInput(req.Input, "run_in_background")
 	timeoutMs := intInput(req.Input, "timeoutMs", bashDefaultTimeoutMs)
 	if timeoutMs <= 0 {
 		timeoutMs = bashDefaultTimeoutMs
@@ -235,165 +243,184 @@ func (s *ToolService) executeBash(ctx context.Context, req ToolExecuteRequest) (
 		}
 	}
 
-	waitCh := make(chan error, 1)
+	// Job-first registration: register every launched bash command immediately so
+	// live output streams to the UI and the user can detach it to background at any time.
+	job := &backgroundJob{
+		sessionID:         req.SessionID,
+		toolUseID:         strings.TrimSpace(req.ToolUseID),
+		command:           command,
+		description:       description,
+		workdir:           cwd,
+		startedAt:         startedAt,
+		cmd:               cmd,
+		stdout:            stdoutBuf,
+		stderr:            stderrBuf,
+		done:              make(chan struct{}),
+		detachCh:          make(chan struct{}),
+		sandboxed:         sandboxed,
+		sandboxMode:       perm,
+		sandboxCleanup:    cleanupAll,
+		createdScratchNow: createdScratchNow,
+		beforeSnap:        beforeSnap,
+		status:            jobStatusRunning,
+		exposedToModel:    runInBackground,
+		streamDone:        make(chan struct{}),
+	}
+	jobID := s.registerBackgroundJob(job)
+
 	go func() {
-		waitCh <- cmd.Wait()
+		waitErr := cmd.Wait()
+		job.finish(waitErr)
+		job.waitStreamDone()
+		s.maybeEmitJobSettled(job)
+		s.pruneFinishedJobs(job.sessionID)
 	}()
+	go s.streamJobOutput(job)
 
-	timer := time.NewTimer(time.Duration(timeoutMs) * time.Millisecond)
-	defer timer.Stop()
-
-	select {
-	case waitErr := <-waitCh:
-		cleanupAll()
-		return finishForegroundBash(
-			waitErr,
-			false,
-			cwd,
-			createdScratchNow,
-			beforeSnap,
-			stdoutBuf,
-			stderrBuf,
-			sandboxed,
-			perm,
-		), nil
-
-	case <-ctx.Done():
-		killProcessTree(cmd)
-		waitErr := <-waitCh
-		cleanupAll()
-		return finishForegroundBash(
-			waitErr,
-			true,
-			cwd,
-			createdScratchNow,
-			beforeSnap,
-			stdoutBuf,
-			stderrBuf,
-			sandboxed,
-			perm,
-		), nil
-
-	case <-timer.C:
-		// Promote long-running command to a background job instead of killing it.
-		job := &backgroundJob{
-			sessionID:         req.SessionID,
-			command:           command,
-			description:       description,
-			workdir:           cwd,
-			startedAt:         startedAt,
-			cmd:               cmd,
-			stdout:            stdoutBuf,
-			stderr:            stderrBuf,
-			done:              make(chan struct{}),
-			sandboxed:         sandboxed,
-			sandboxMode:       perm,
-			sandboxCleanup:    cleanupAll,
-			createdScratchNow: createdScratchNow,
-			beforeSnap:        beforeSnap,
-			status:            jobStatusRunning,
-		}
-		jobID := s.registerBackgroundJob(job)
-
-		go func() {
-			waitErr := <-waitCh
-			job.finish(waitErr)
-		}()
-
-		stdoutRaw, stderrRaw, dropped := job.consumeDelta()
-		stdoutStr, outTrunc := truncateOutput(strings.TrimRight(stdoutRaw, "\r\n"), bashMaxOutputBytes)
-		stderrStr, errTrunc := truncateOutput(strings.TrimRight(stderrRaw, "\r\n"), bashMaxOutputBytes)
-		truncated := dropped || outTrunc || errTrunc
-
-		var out strings.Builder
-		if stdoutStr != "" {
-			out.WriteString(stdoutStr)
-		}
-		if stderrStr != "" {
-			if out.Len() > 0 {
-				out.WriteString("\n")
-			}
-			out.WriteString("[stderr]\n")
-			out.WriteString(stderrStr)
-		}
-		if truncated {
-			if out.Len() > 0 {
-				out.WriteString("\n")
-			}
-			out.WriteString(fmt.Sprintf("[truncated: output exceeded %d KB limit]", bashMaxOutputBytes/1024))
-		}
-		if out.Len() > 0 {
-			out.WriteString("\n")
-		}
-		out.WriteString(fmt.Sprintf(
-			"[command still running after %dms; moved to background job: %s. Use job_output(job_id=%q) to inspect output or job_kill(job_id=%q) to terminate it.]",
-			timeoutMs, jobID, jobID, jobID,
-		))
-
+	if runInBackground {
 		assignedScratch := ""
 		if createdScratchNow {
 			assignedScratch = cwd
 		}
-
 		meta := map[string]any{
 			"backgroundJobId": jobID,
 			"jobStatus":       jobStatusRunning,
-			"truncated":       truncated,
 			"workdir":         cwd,
 			"sandboxed":       sandboxed,
 		}
 		if sandboxed {
 			meta["sandboxMode"] = perm
 		}
-
 		return ToolExecuteResult{
-			ModelContent:    out.String(),
+			ModelContent: fmt.Sprintf(
+				"Started background job: %s. Use job_output(job_id=%q) to inspect output, job_list() to check status, or job_kill(job_id=%q) to stop it.",
+				jobID, jobID, jobID,
+			),
 			IsError:         false,
 			AssignedScratch: assignedScratch,
 			UIMeta:          meta,
 		}, nil
 	}
+
+	timer := time.NewTimer(time.Duration(timeoutMs) * time.Millisecond)
+	defer timer.Stop()
+
+	select {
+	case <-job.done:
+		s.unregisterBackgroundJob(jobID)
+		return finishForegroundBash(job, false), nil
+
+	case <-ctx.Done():
+		job.kill()
+		<-job.done
+		s.unregisterBackgroundJob(jobID)
+		return finishForegroundBash(job, true), nil
+
+	case <-job.detachCh:
+		return s.promoteRunningJobResult(job, true, timeoutMs), nil
+
+	case <-timer.C:
+		return s.promoteRunningJobResult(job, false, timeoutMs), nil
+	}
 }
 
-func finishForegroundBash(
-	waitErr error,
-	canceled bool,
-	cwd string,
-	createdScratchNow bool,
-	beforeSnap map[string]fileStamp,
-	stdoutBuf *ringBuffer,
-	stderrBuf *ringBuffer,
-	sandboxed bool,
-	perm string,
-) ToolExecuteResult {
-	exitCode := 0
-	if waitErr != nil {
-		var exitErr *exec.ExitError
-		if errors.As(waitErr, &exitErr) {
-			exitCode = exitErr.ExitCode()
-		} else {
-			exitCode = -1
-		}
+func (s *ToolService) promoteRunningJobResult(job *backgroundJob, byUser bool, timeoutMs int) ToolExecuteResult {
+	alreadySettled := job.markExposedToModel()
+	if alreadySettled {
+		job.waitStreamDone()
+		s.maybeEmitJobSettled(job)
 	}
 
-	// Post-exit scratch cleanup & snapshot diff:
-	// Only remove cwd if it was newly lazily created for this call AND remains completely empty.
-	assignedScratch := ""
-	var producedFiles []string
-	effectiveWorkdir := cwd
-	if createdScratchNow && isDirEmpty(cwd) {
-		_ = os.Remove(cwd)
-		effectiveWorkdir = ""
+	stdoutRaw, stderrRaw, dropped := job.consumeDelta()
+	stdoutStr, outTrunc := truncateOutput(strings.TrimRight(stdoutRaw, "\r\n"), bashMaxOutputBytes)
+	stderrStr, errTrunc := truncateOutput(strings.TrimRight(stderrRaw, "\r\n"), bashMaxOutputBytes)
+	truncated := dropped || outTrunc || errTrunc
+
+	var out strings.Builder
+	if stdoutStr != "" {
+		out.WriteString(stdoutStr)
+	}
+	if stderrStr != "" {
+		if out.Len() > 0 {
+			out.WriteString("\n")
+		}
+		out.WriteString("[stderr]\n")
+		out.WriteString(stderrStr)
+	}
+	if truncated {
+		if out.Len() > 0 {
+			out.WriteString("\n")
+		}
+		out.WriteString(fmt.Sprintf("[truncated: output exceeded %d KB limit; kept tail]", bashMaxOutputBytes/1024))
+	}
+	if out.Len() > 0 {
+		out.WriteString("\n")
+	}
+	if byUser {
+		out.WriteString(fmt.Sprintf(
+			"[moved to background by user as %s. Do NOT wait for completion or call job_output in this turn — reply to the user immediately and let the command keep running in the background. The user can monitor live progress in the background jobs tray and trigger a follow-up once it finishes.]",
+			job.id,
+		))
 	} else {
-		if createdScratchNow {
-			assignedScratch = cwd
-		}
-		afterSnap := snapshotDirFiles(cwd)
-		producedFiles = diffSnapshots(cwd, beforeSnap, afterSnap)
+		out.WriteString(fmt.Sprintf(
+			"[command still running after %dms; moved to background job: %s. Do not busy-poll job_output; reply to the user or inspect later with job_output(job_id=%q) / job_kill(job_id=%q).]",
+			timeoutMs, job.id, job.id, job.id,
+		))
 	}
 
-	stdoutRaw, _, outDropped := stdoutBuf.readFrom(0)
-	stderrRaw, _, errDropped := stderrBuf.readFrom(0)
+	assignedScratch := ""
+	if job.createdScratchNow {
+		assignedScratch = job.workdir
+	}
+
+	job.mu.Lock()
+	status := job.status
+	exitCode := job.exitCode
+	job.mu.Unlock()
+
+	meta := map[string]any{
+		"backgroundJobId": job.id,
+		"jobStatus":       status,
+		"truncated":       truncated,
+		"workdir":         job.workdir,
+		"sandboxed":       job.sandboxed,
+	}
+	if job.sandboxed {
+		meta["sandboxMode"] = job.sandboxMode
+	}
+	if status != jobStatusRunning {
+		meta["exitCode"] = exitCode
+	}
+
+	return ToolExecuteResult{
+		ModelContent:    out.String(),
+		IsError:         false,
+		AssignedScratch: assignedScratch,
+		UIMeta:          meta,
+	}
+}
+
+func finishForegroundBash(job *backgroundJob, canceled bool) ToolExecuteResult {
+	job.mu.Lock()
+	exitCode := job.exitCode
+	producedFiles := append([]string(nil), job.producedFiles...)
+	job.mu.Unlock()
+
+	// Clean up a newly lazily-created empty scratch directory strictly on the
+	// foreground-completion path so it can never race with background promotion.
+	assignedScratch := ""
+	effectiveWorkdir := job.workdir
+	if job.createdScratchNow {
+		if isDirEmpty(job.workdir) {
+			_ = os.Remove(job.workdir)
+			effectiveWorkdir = ""
+		} else {
+			assignedScratch = job.workdir
+		}
+	}
+
+	stdoutRaw, _, outDropped := job.stdout.readFrom(0)
+	stderrRaw, _, errDropped := job.stderr.readFrom(0)
 	stdoutStr, outTrunc := truncateOutput(strings.TrimRight(stdoutRaw, "\r\n"), bashMaxOutputBytes)
 	stderrStr, errTrunc := truncateOutput(strings.TrimRight(stderrRaw, "\r\n"), bashMaxOutputBytes)
 	truncated := outDropped || errDropped || outTrunc || errTrunc
@@ -413,7 +440,7 @@ func finishForegroundBash(
 		if out.Len() > 0 {
 			out.WriteString("\n")
 		}
-		out.WriteString(fmt.Sprintf("[truncated: output exceeded %d KB limit]", bashMaxOutputBytes/1024))
+		out.WriteString(fmt.Sprintf("[truncated: output exceeded %d KB limit; kept tail]", bashMaxOutputBytes/1024))
 	}
 	if canceled {
 		if out.Len() > 0 {
@@ -427,12 +454,12 @@ func finishForegroundBash(
 		}
 		out.WriteString(fmt.Sprintf("[exit code: %d]", exitCode))
 	}
-	if sandboxed && !canceled && exitCode != 0 && looksLikeSandboxDenial(stderrStr) {
+	if job.sandboxed && !canceled && exitCode != 0 && looksLikeSandboxDenial(stderrStr) {
 		if out.Len() > 0 {
 			out.WriteString("\n")
 		}
-		out.WriteString(fmt.Sprintf("[sandbox: kernel blocked a write outside allowed roots under %s mode]", perm))
-		if hint := sandboxEscalationHint(perm); hint != "" {
+		out.WriteString(fmt.Sprintf("[sandbox: kernel blocked a write outside allowed roots under %s mode]", job.sandboxMode))
+		if hint := sandboxEscalationHint(job.sandboxMode); hint != "" {
 			out.WriteString("\n")
 			out.WriteString(hint)
 		}
@@ -444,10 +471,10 @@ func finishForegroundBash(
 	meta := map[string]any{
 		"exitCode":  exitCode,
 		"truncated": truncated,
-		"sandboxed": sandboxed,
+		"sandboxed": job.sandboxed,
 	}
-	if sandboxed {
-		meta["sandboxMode"] = perm
+	if job.sandboxed {
+		meta["sandboxMode"] = job.sandboxMode
 	}
 	if effectiveWorkdir != "" {
 		meta["workdir"] = effectiveWorkdir

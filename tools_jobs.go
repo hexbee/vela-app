@@ -4,21 +4,57 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
+
+	"github.com/egoist/mygo"
 )
 
 const (
-	jobRingBufferBytes = 256 * 1024
-	jobMaxWaitMs       = 30_000
-	jobStatusRunning   = "running"
-	jobStatusCompleted = "completed"
-	jobStatusKilled    = "killed"
+	jobRingBufferBytes        = 256 * 1024
+	jobMaxWaitMs              = 30_000
+	jobStreamFlushInterval    = 120 * time.Millisecond
+	jobStreamMaxChunkBytes    = 16 * 1024
+	jobSettledTailBytes       = 2048
+	maxFinishedJobsPerSession = 20
+	jobStatusRunning          = "running"
+	jobStatusCompleted        = "completed"
+	jobStatusKilled           = "killed"
 )
+
+// JobOutputDelta carries live incremental stdout/stderr output for a running or finishing bash job.
+type JobOutputDelta struct {
+	JobID     string `json:"jobId"`
+	SessionID string `json:"sessionId"`
+	ToolUseID string `json:"toolUseId,omitempty"`
+	Stdout    string `json:"stdout,omitempty"`
+	Stderr    string `json:"stderr,omitempty"`
+	Status    string `json:"status"` // "running" | "completed" | "killed"
+}
+
+// JobSettledNotice notifies the frontend when a background bash job completes or is killed.
+type JobSettledNotice struct {
+	JobID         string   `json:"jobId"`
+	SessionID     string   `json:"sessionId"`
+	ToolUseID     string   `json:"toolUseId,omitempty"`
+	Command       string   `json:"command"`
+	Description   string   `json:"description,omitempty"`
+	Status        string   `json:"status"` // "completed" | "killed"
+	ExitCode      int      `json:"exitCode"`
+	OutputTail    string   `json:"outputTail,omitempty"`
+	ProducedFiles []string `json:"producedFiles,omitempty"`
+	EndedAt       int64    `json:"endedAt"`
+}
+
+// JobOutputEvent pushes live bash stdout/stderr deltas and status updates to the frontend.
+var JobOutputEvent = mygo.NewEvent[JobOutputDelta]("job:output")
+
+// JobSettledEvent notifies the frontend when a background bash job finishes or is terminated.
+var JobSettledEvent = mygo.NewEvent[JobSettledNotice]("job:settled")
 
 // ringBuffer is a thread-safe bounded circular byte buffer that tracks cumulative
 // written byte offsets so multiple reads can consume incremental deltas safely.
@@ -83,6 +119,52 @@ func (r *ringBuffer) readFrom(from int64) (text string, nextOffset int64, droppe
 	return string(r.buf[startIdx:]), nextOffset, dropped
 }
 
+// readUTF8SafeFrom reads bytes since `from` and, when `final` is false, holds back
+// any trailing incomplete multi-byte UTF-8 sequence so streaming chunks never emit U+FFFD.
+func (r *ringBuffer) readUTF8SafeFrom(from int64, final bool) (text string, nextOffset int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	nextOffset = r.totalWritten
+	baseOffset := r.totalWritten - int64(len(r.buf))
+	if from < baseOffset {
+		from = baseOffset
+	}
+	if from >= r.totalWritten {
+		return "", nextOffset
+	}
+	chunk := r.buf[int(from-baseOffset):]
+	if !final {
+		hold := trailingIncompleteUTF8Bytes(chunk)
+		if hold > 0 {
+			chunk = chunk[:len(chunk)-hold]
+			nextOffset -= int64(hold)
+		}
+	}
+	if len(chunk) == 0 {
+		return "", nextOffset
+	}
+	return string(chunk), nextOffset
+}
+
+func trailingIncompleteUTF8Bytes(b []byte) int {
+	n := len(b)
+	if n == 0 {
+		return 0
+	}
+	// Walk back at most 3 bytes to find the start of the final rune.
+	for back := 1; back <= 3 && back <= n; back++ {
+		idx := n - back
+		if utf8.RuneStart(b[idx]) {
+			if utf8.FullRune(b[idx:]) {
+				return 0
+			}
+			return back
+		}
+	}
+	return 0
+}
+
 func (r *ringBuffer) waitChannel(from int64) (<-chan struct{}, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -96,6 +178,7 @@ func (r *ringBuffer) waitChannel(from int64) (<-chan struct{}, bool) {
 type BackgroundJobInfo struct {
 	ID          string `json:"id"`
 	SessionID   string `json:"sessionId"`
+	ToolUseID   string `json:"toolUseId,omitempty"`
 	Command     string `json:"command"`
 	Description string `json:"description"`
 	Workdir     string `json:"workdir"`
@@ -108,16 +191,20 @@ type BackgroundJobInfo struct {
 }
 
 type backgroundJob struct {
-	id          string
-	sessionID   string
-	command     string
-	description string
-	workdir     string
-	startedAt   time.Time
-	cmd         *exec.Cmd
-	stdout      *ringBuffer
-	stderr      *ringBuffer
+	id             string
+	sessionID      string
+	toolUseID      string
+	command        string
+	description    string
+	workdir        string
+	startedAt      time.Time
+	cmd            *exec.Cmd
+	stdout         *ringBuffer
+	stderr         *ringBuffer
 	done           chan struct{}
+	detachCh       chan struct{}
+	detachOnce     sync.Once
+	streamDone     chan struct{}
 	sandboxed      bool
 	sandboxMode    string
 	sandboxCleanup func()
@@ -125,14 +212,18 @@ type backgroundJob struct {
 	createdScratchNow bool
 	beforeSnap        map[string]fileStamp
 
-	mu               sync.Mutex
-	status           string
-	exitCode         int
-	endedAt          time.Time
-	stdoutCursor     int64
-	stderrCursor     int64
-	reportedProduced bool
-	producedFiles    []string
+	mu                 sync.Mutex
+	status             string
+	exitCode           int
+	endedAt            time.Time
+	stdoutCursor       int64
+	stderrCursor       int64
+	streamStdoutCursor int64
+	streamStderrCursor int64
+	reportedProduced   bool
+	producedFiles      []string
+	exposedToModel     bool
+	settledEmitted     bool
 }
 
 func (j *backgroundJob) info() BackgroundJobInfo {
@@ -141,6 +232,7 @@ func (j *backgroundJob) info() BackgroundJobInfo {
 	info := BackgroundJobInfo{
 		ID:          j.id,
 		SessionID:   j.sessionID,
+		ToolUseID:   j.toolUseID,
 		Command:     j.command,
 		Description: j.description,
 		Workdir:     j.workdir,
@@ -154,6 +246,32 @@ func (j *backgroundJob) info() BackgroundJobInfo {
 		info.EndedAt = j.endedAt.UnixMilli()
 	}
 	return info
+}
+
+func (j *backgroundJob) requestDetach() {
+	if j.detachCh == nil {
+		return
+	}
+	j.detachOnce.Do(func() {
+		close(j.detachCh)
+	})
+}
+
+func (j *backgroundJob) markExposedToModel() (alreadySettled bool) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.exposedToModel = true
+	return j.status != jobStatusRunning
+}
+
+// waitStreamDone blocks until the live-output goroutine has emitted its final
+// delta, guaranteeing job:settled always arrives after the last job:output chunk.
+// It returns immediately for jobs that never started streaming.
+func (j *backgroundJob) waitStreamDone() {
+	if j.streamDone == nil {
+		return
+	}
+	<-j.streamDone
 }
 
 func (j *backgroundJob) consumeDelta() (stdoutStr, stderrStr string, dropped bool) {
@@ -173,6 +291,66 @@ func (j *backgroundJob) consumeDelta() (stdoutStr, stderrStr string, dropped boo
 	return outText, errText, outDropped || errDropped
 }
 
+func (j *backgroundJob) consumeStreamDelta(final bool) (stdoutStr, stderrStr string, status string) {
+	j.mu.Lock()
+	outCur := j.streamStdoutCursor
+	errCur := j.streamStderrCursor
+	j.mu.Unlock()
+
+	outText, nextOut := j.stdout.readUTF8SafeFrom(outCur, final)
+	errText, nextErr := j.stderr.readUTF8SafeFrom(errCur, final)
+
+	j.mu.Lock()
+	j.streamStdoutCursor = nextOut
+	j.streamStderrCursor = nextErr
+	status = j.status
+	j.mu.Unlock()
+
+	return outText, errText, status
+}
+
+func (j *backgroundJob) buildSettledNotice() (JobSettledNotice, bool) {
+	j.mu.Lock()
+	if j.settledEmitted || !j.exposedToModel || j.status == jobStatusRunning {
+		j.mu.Unlock()
+		return JobSettledNotice{}, false
+	}
+	j.settledEmitted = true
+	status := j.status
+	exitCode := j.exitCode
+	endedAt := j.endedAt.UnixMilli()
+	produced := append([]string(nil), j.producedFiles...)
+	j.mu.Unlock()
+
+	outRaw, _, _ := j.stdout.readFrom(0)
+	errRaw, _, _ := j.stderr.readFrom(0)
+	var combined strings.Builder
+	if outTrim := strings.TrimRight(outRaw, "\r\n"); outTrim != "" {
+		combined.WriteString(outTrim)
+	}
+	if errTrim := strings.TrimRight(errRaw, "\r\n"); errTrim != "" {
+		if combined.Len() > 0 {
+			combined.WriteString("\n")
+		}
+		combined.WriteString("[stderr]\n")
+		combined.WriteString(errTrim)
+	}
+	tail, _ := truncateOutput(combined.String(), jobSettledTailBytes)
+
+	return JobSettledNotice{
+		JobID:         j.id,
+		SessionID:     j.sessionID,
+		ToolUseID:     j.toolUseID,
+		Command:       j.command,
+		Description:   j.description,
+		Status:        status,
+		ExitCode:      exitCode,
+		OutputTail:    tail,
+		ProducedFiles: produced,
+		EndedAt:       endedAt,
+	}, true
+}
+
 func (j *backgroundJob) finish(waitErr error) {
 	if j.sandboxCleanup != nil {
 		j.sandboxCleanup()
@@ -190,12 +368,8 @@ func (j *backgroundJob) finish(waitErr error) {
 
 	var produced []string
 	if j.workdir != "" {
-		if j.createdScratchNow && isDirEmpty(j.workdir) {
-			_ = os.Remove(j.workdir)
-		} else {
-			afterSnap := snapshotDirFiles(j.workdir)
-			produced = diffSnapshots(j.workdir, j.beforeSnap, afterSnap)
-		}
+		afterSnap := snapshotDirFiles(j.workdir)
+		produced = diffSnapshots(j.workdir, j.beforeSnap, afterSnap)
 	}
 
 	j.mu.Lock()
@@ -223,6 +397,116 @@ func (j *backgroundJob) kill() {
 	}
 }
 
+func (s *ToolService) emitJobOutput(delta JobOutputDelta) {
+	s.mu.Lock()
+	fn := s.emitOutputFn
+	s.mu.Unlock()
+	if fn != nil {
+		fn(delta)
+		return
+	}
+	if win := getMainWindow(); win != nil {
+		_ = JobOutputEvent.Emit(win, delta)
+	}
+}
+
+func (s *ToolService) emitJobSettled(notice JobSettledNotice) {
+	s.mu.Lock()
+	fn := s.emitSettledFn
+	s.mu.Unlock()
+	if fn != nil {
+		fn(notice)
+		return
+	}
+	if win := getMainWindow(); win != nil {
+		_ = JobSettledEvent.Emit(win, notice)
+	}
+}
+
+func (s *ToolService) maybeEmitJobSettled(job *backgroundJob) {
+	if notice, ok := job.buildSettledNotice(); ok {
+		s.emitJobSettled(notice)
+	}
+}
+
+func (s *ToolService) streamJobOutput(job *backgroundJob) {
+	if job.streamDone != nil {
+		defer close(job.streamDone)
+	}
+
+	// Skip emitting a stale "running" announcement if a fast foreground command already exited.
+	select {
+	case <-job.done:
+		job.mu.Lock()
+		exposed := job.exposedToModel
+		job.mu.Unlock()
+		if !exposed {
+			return
+		}
+	default:
+	}
+
+	// Immediately announce job identity so the UI can bind toolUseId -> jobId and offer "Move to background".
+	s.emitJobOutput(JobOutputDelta{
+		JobID:     job.id,
+		SessionID: job.sessionID,
+		ToolUseID: job.toolUseID,
+		Status:    jobStatusRunning,
+	})
+
+	flush := func(forceStatus bool) {
+		outStr, errStr, status := job.consumeStreamDelta(forceStatus)
+		if outStr == "" && errStr == "" && !forceStatus {
+			return
+		}
+		if len(outStr) > jobStreamMaxChunkBytes {
+			outStr, _ = truncateOutput(outStr, jobStreamMaxChunkBytes)
+		}
+		if len(errStr) > jobStreamMaxChunkBytes {
+			errStr, _ = truncateOutput(errStr, jobStreamMaxChunkBytes)
+		}
+		s.emitJobOutput(JobOutputDelta{
+			JobID:     job.id,
+			SessionID: job.sessionID,
+			ToolUseID: job.toolUseID,
+			Stdout:    outStr,
+			Stderr:    errStr,
+			Status:    status,
+		})
+	}
+
+	for {
+		job.mu.Lock()
+		outCur := job.streamStdoutCursor
+		errCur := job.streamStderrCursor
+		job.mu.Unlock()
+
+		outCh, hasOut := job.stdout.waitChannel(outCur)
+		errCh, hasErr := job.stderr.waitChannel(errCur)
+
+		if !hasOut && !hasErr {
+			select {
+			case <-outCh:
+			case <-errCh:
+			case <-job.done:
+				flush(true)
+				return
+			}
+		}
+
+		// Brief coalesce window to avoid flooding WebView IPC on chatty output.
+		timer := time.NewTimer(jobStreamFlushInterval)
+		select {
+		case <-timer.C:
+			flush(false)
+		case <-job.done:
+			timer.Stop()
+			flush(true)
+			return
+		}
+	}
+}
+
 func (s *ToolService) registerBackgroundJob(job *backgroundJob) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -235,6 +519,48 @@ func (s *ToolService) registerBackgroundJob(job *backgroundJob) string {
 	return job.id
 }
 
+func (s *ToolService) unregisterBackgroundJob(jobID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.jobs, jobID)
+}
+
+// pruneFinishedJobs evicts the oldest completed/killed background jobs for sessionID
+// once the count exceeds maxFinishedJobsPerSession to bound ring-buffer memory.
+func (s *ToolService) pruneFinishedJobs(sessionID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.jobs) <= maxFinishedJobsPerSession {
+		return
+	}
+	type finishedEntry struct {
+		id      string
+		endedAt time.Time
+	}
+	var finished []finishedEntry
+	for id, j := range s.jobs {
+		if j.sessionID != sessionID {
+			continue
+		}
+		j.mu.Lock()
+		done := j.exposedToModel && j.status != jobStatusRunning
+		ended := j.endedAt
+		j.mu.Unlock()
+		if done {
+			finished = append(finished, finishedEntry{id: id, endedAt: ended})
+		}
+	}
+	if len(finished) <= maxFinishedJobsPerSession {
+		return
+	}
+	sort.Slice(finished, func(i, k int) bool {
+		return finished[i].endedAt.After(finished[k].endedAt)
+	})
+	for _, stale := range finished[maxFinishedJobsPerSession:] {
+		delete(s.jobs, stale.id)
+	}
+}
+
 func (s *ToolService) getBackgroundJob(jobID string) *backgroundJob {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -244,13 +570,59 @@ func (s *ToolService) getBackgroundJob(jobID string) *backgroundJob {
 	return s.jobs[jobID]
 }
 
-// ListBackgroundJobs returns all background bash jobs for a session (or all sessions if sessionID is empty).
+func (s *ToolService) findBackgroundJob(target string) *backgroundJob {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.jobs == nil {
+		return nil
+	}
+	if j, ok := s.jobs[target]; ok {
+		return j
+	}
+	var matched *backgroundJob
+	for _, j := range s.jobs {
+		if j.toolUseID == target {
+			if matched == nil || j.startedAt.After(matched.startedAt) {
+				matched = j
+			}
+		}
+	}
+	return matched
+}
+
+// PromoteBackgroundJob detaches a currently running foreground bash command (matched by
+// job ID or toolUseId) into a background job immediately so the model can resume replying.
+func (s *ToolService) PromoteBackgroundJob(target string) (BackgroundJobInfo, error) {
+	job := s.findBackgroundJob(target)
+	if job == nil {
+		return BackgroundJobInfo{}, fmt.Errorf("running bash job %q not found", target)
+	}
+	job.mu.Lock()
+	running := job.status == jobStatusRunning
+	job.mu.Unlock()
+	if !running {
+		return job.info(), nil
+	}
+	job.requestDetach()
+	return job.info(), nil
+}
+
+// ListBackgroundJobs returns all exposed background bash jobs for a session (or all sessions if sessionID is empty).
 func (s *ToolService) ListBackgroundJobs(sessionID string) []BackgroundJobInfo {
 	s.mu.Lock()
 	jobs := make([]*backgroundJob, 0, len(s.jobs))
 	for _, j := range s.jobs {
 		if sessionID == "" || j.sessionID == sessionID {
-			jobs = append(jobs, j)
+			j.mu.Lock()
+			exposed := j.exposedToModel
+			j.mu.Unlock()
+			if exposed {
+				jobs = append(jobs, j)
+			}
 		}
 	}
 	s.mu.Unlock()
@@ -267,7 +639,7 @@ func (s *ToolService) ListBackgroundJobs(sessionID string) []BackgroundJobInfo {
 
 // KillBackgroundJob terminates a running background bash job by ID.
 func (s *ToolService) KillBackgroundJob(jobID string) error {
-	job := s.getBackgroundJob(strings.TrimSpace(jobID))
+	job := s.findBackgroundJob(jobID)
 	if job == nil {
 		return fmt.Errorf("background job %q not found", jobID)
 	}
@@ -275,6 +647,48 @@ func (s *ToolService) KillBackgroundJob(jobID string) error {
 	select {
 	case <-job.done:
 	case <-time.After(3 * time.Second):
+	}
+	return nil
+}
+
+// KillSessionBackgroundJobs terminates all running background bash jobs belonging to
+// sessionID, waits briefly for cleanup hooks, and removes all job records for that session.
+func (s *ToolService) KillSessionBackgroundJobs(sessionID string) error {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return nil
+	}
+
+	s.mu.Lock()
+	var running []*backgroundJob
+	for id, j := range s.jobs {
+		if j.sessionID != sessionID {
+			continue
+		}
+		j.mu.Lock()
+		j.settledEmitted = true
+		isRunning := j.status == jobStatusRunning
+		j.mu.Unlock()
+		if isRunning {
+			running = append(running, j)
+		}
+		delete(s.jobs, id)
+	}
+	s.mu.Unlock()
+
+	for _, j := range running {
+		j.kill()
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for _, j := range running {
+		rem := time.Until(deadline)
+		if rem <= 0 {
+			break
+		}
+		select {
+		case <-j.done:
+		case <-time.After(rem):
+		}
 	}
 	return nil
 }
@@ -310,6 +724,37 @@ func (s *ToolService) KillAllBackgroundJobs() {
 	}
 }
 
+func (s *ToolService) executeJobList(req ToolExecuteRequest) (ToolExecuteResult, error) {
+	jobs := s.ListBackgroundJobs(req.SessionID)
+	if len(jobs) == 0 {
+		return ToolExecuteResult{
+			ModelContent: "(no background jobs)",
+			IsError:      false,
+		}, nil
+	}
+
+	var out strings.Builder
+	for i, j := range jobs {
+		if i > 0 {
+			out.WriteString("\n")
+		}
+		label := strings.TrimSpace(j.Description)
+		if label == "" {
+			label = j.Command
+		}
+		if j.Status != jobStatusRunning {
+			out.WriteString(fmt.Sprintf("%s [%s | exit=%d] — %s", j.ID, j.Status, j.ExitCode, label))
+		} else {
+			out.WriteString(fmt.Sprintf("%s [%s] — %s", j.ID, j.Status, label))
+		}
+	}
+
+	return ToolExecuteResult{
+		ModelContent: out.String(),
+		IsError:      false,
+	}, nil
+}
+
 func (s *ToolService) executeJobOutput(ctx context.Context, req ToolExecuteRequest) (ToolExecuteResult, error) {
 	jobID := strings.TrimSpace(stringInput(req.Input, "job_id"))
 	if jobID == "" {
@@ -333,25 +778,17 @@ func (s *ToolService) executeJobOutput(ctx context.Context, req ToolExecuteReque
 
 	if waitMs > 0 {
 		job.mu.Lock()
-		outCur := job.stdoutCursor
-		errCur := job.stderrCursor
 		running := job.status == jobStatusRunning
 		job.mu.Unlock()
 
 		if running {
-			outCh, hasOut := job.stdout.waitChannel(outCur)
-			errCh, hasErr := job.stderr.waitChannel(errCur)
-			if !hasOut && !hasErr {
-				timer := time.NewTimer(time.Duration(waitMs) * time.Millisecond)
-				select {
-				case <-outCh:
-				case <-errCh:
-				case <-job.done:
-				case <-ctx.Done():
-				case <-timer.C:
-				}
-				timer.Stop()
+			timer := time.NewTimer(time.Duration(waitMs) * time.Millisecond)
+			select {
+			case <-job.done:
+			case <-ctx.Done():
+			case <-timer.C:
 			}
+			timer.Stop()
 		}
 	}
 

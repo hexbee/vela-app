@@ -15,6 +15,7 @@ export interface AppInfo {
 export interface BackgroundJobInfo {
   id: string;
   sessionId: string;
+  toolUseId?: string;
   command: string;
   description: string;
   workdir: string;
@@ -44,6 +45,32 @@ export interface FilePreview {
   mimeType: string;
   content: string;
   truncated: boolean;
+}
+
+/** JobOutputDelta carries live incremental stdout/stderr output for a running or finishing bash job. */
+export interface JobOutputDelta {
+  jobId: string;
+  sessionId: string;
+  toolUseId?: string;
+  stdout?: string;
+  stderr?: string;
+  /** "running" | "completed" | "killed" */
+  status: string;
+}
+
+/** JobSettledNotice notifies the frontend when a background bash job completes or is killed. */
+export interface JobSettledNotice {
+  jobId: string;
+  sessionId: string;
+  toolUseId?: string;
+  command: string;
+  description?: string;
+  /** "completed" | "killed" */
+  status: string;
+  exitCode: number;
+  outputTail?: string;
+  producedFiles?: string[];
+  endedAt: number;
 }
 
 /** MCPImportResult returns validation diagnostics and parsed servers for JSON import. */
@@ -233,7 +260,9 @@ export interface ToolClassifyResult {
 /** ToolExecuteRequest is the unified RPC payload for classifying and executing a client tool. */
 export interface ToolExecuteRequest {
   sessionId: string;
-  /** read | write | edit | delete_file | glob | grep | bash | job_output | job_kill | skill */
+  /** Optional client tool_use block ID for correlating live stream & promote actions */
+  toolUseId?: string;
+  /** read | write | edit | delete_file | glob | grep | bash | job_output | job_list | job_kill | skill */
   toolName: string;
   input: Record<string, unknown>;
   /** User workspace or existing scratchDir; empty triggers lazy scratch on write/edit/bash */
@@ -468,9 +497,23 @@ export const ToolService = {
   killBackgroundJob(jobID: string): Promise<void> {
     return call("ToolService.KillBackgroundJob", jobID);
   },
-  /** ListBackgroundJobs returns all background bash jobs for a session (or all sessions if sessionID is empty). */
+  /**
+   * KillSessionBackgroundJobs terminates all running background bash jobs belonging to
+   * sessionID, waits briefly for cleanup hooks, and removes all job records for that session.
+   */
+  killSessionBackgroundJobs(sessionID: string): Promise<void> {
+    return call("ToolService.KillSessionBackgroundJobs", sessionID);
+  },
+  /** ListBackgroundJobs returns all exposed background bash jobs for a session (or all sessions if sessionID is empty). */
   listBackgroundJobs(sessionID: string): Promise<BackgroundJobInfo[]> {
     return call("ToolService.ListBackgroundJobs", sessionID);
+  },
+  /**
+   * PromoteBackgroundJob detaches a currently running foreground bash command (matched by
+   * job ID or toolUseId) into a background job immediately so the model can resume replying.
+   */
+  promoteBackgroundJob(target: string): Promise<BackgroundJobInfo> {
+    return call("ToolService.PromoteBackgroundJob", target);
   },
   /**
    * ReleaseSessionSandbox revokes and removes any pooled sandbox private temp directories
@@ -514,4 +557,8 @@ export const events = {
   menuAction: event<MenuAction>("menu:action"),
   /** MCPStateEvent pushes live MCP server configuration and connection status updates to the frontend. */
   mcpState: event<MCPSnapshot>("mcp:state"),
+  /** JobOutputEvent pushes live bash stdout/stderr deltas and status updates to the frontend. */
+  jobOutput: event<JobOutputDelta>("job:output"),
+  /** JobSettledEvent notifies the frontend when a background bash job finishes or is terminated. */
+  jobSettled: event<JobSettledNotice>("job:settled"),
 } as const;
