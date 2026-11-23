@@ -1,5 +1,5 @@
 import { getRegionName, provinces, type UserLocation } from '../location.js'
-import { detectClientOS, type Locale } from '../settings.js'
+import type { Locale } from '../settings.js'
 import { formatDate } from '../../utils/format.js'
 import { translate } from '../../i18n/index.js'
 
@@ -15,15 +15,14 @@ const locationName = (location: UserLocation | null, locale: Locale): string => 
   return getRegionName(location.region, locale)
 }
 
-const clientPlatformName = (): 'macOS' | 'Windows' | 'Linux' => {
-  switch (detectClientOS()) {
-    case 'darwin':
-      return 'macOS'
-    case 'windows':
-      return 'Windows'
-    case 'linux':
-      return 'Linux'
+/** 校验并兜底历史快照的 platform 字段，确保满足服务端 role: 'latest_reminder' 仅接受 App/Web 的约束。 */
+export const sanitizeLatestReminder = (reminder: string): string => {
+  const parts = reminder.split(',')
+  if (parts.length !== 5 || parts[3] === 'App' || parts[3] === 'Web') {
+    return reminder
   }
+  parts[3] = 'App'
+  return parts.join(',')
 }
 
 /** 模型约定的五项信息；日期与星期使用浏览器本地时区，避免 UTC 日期跨日。 */
@@ -35,7 +34,7 @@ export const createLatestReminder = (
     formatDate(now),
     new Intl.DateTimeFormat(locale, { weekday: 'long' }).format(now),
     locationName(location, locale),
-    clientPlatformName(),
+    'App',
     translate('latestReminderLanguage'),
   ].join(',')
 }

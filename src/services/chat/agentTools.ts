@@ -2,7 +2,7 @@ import { ToolService, type ToolExecuteRequest } from '../../mygo.js'
 import type { ClientToolDefinition } from '../api/types.js'
 import { cleanupForegroundJob, registerBackgroundJobMeta } from '../jobs/store.js'
 import { isMCPReadOnlyTool, markSessionMCPToolsLoaded } from '../mcp/store.js'
-import { useSettings } from '../settings.js'
+import { detectClientOS, useSettings } from '../settings.js'
 import type { PermissionMode } from '../workspace/types.js'
 import type { ClientToolResultPart, ClientToolUsePart, ToolFileDiff, ToolUIMeta } from './types.js'
 
@@ -256,7 +256,18 @@ export type AgentWorkspaceContext = {
   settledJobsReminder?: string
 }
 
-/** 组装包含工作区状态、权限边界、Skills 渐进式摘要与 MCP 指令/按需目录的系统提示，避免普通闲聊误触磁盘探测 */
+const CLIENT_OS_NAME: 'macOS' | 'Windows' | 'Linux' = (() => {
+  switch (detectClientOS()) {
+    case 'darwin':
+      return 'macOS'
+    case 'windows':
+      return 'Windows'
+    case 'linux':
+      return 'Linux'
+  }
+})()
+
+/** 组装包含操作系统、工作区状态、权限边界、Skills 渐进式摘要与 MCP 指令/按需目录的系统提示，避免普通闲聊误触磁盘探测 */
 export const buildAgentSystemPrompt = (basePrompt: string, ctx: AgentWorkspaceContext): string => {
   const permissionNote =
     ctx.permissionMode === 'read-only'
@@ -265,7 +276,7 @@ export const buildAgentSystemPrompt = (basePrompt: string, ctx: AgentWorkspaceCo
         ? '当前权限档位：完全权限（full-access），允许跨目录读写文件与执行常规命令（高危删除或提权命令仍需一次性确认）。'
         : '当前权限档位：工作区内修改（workspace-write），允许在当前工作区或会话临时目录内读写编辑文件以及执行严格只读命令；非只读命令或越界路径会请求用户一次性审批，且命令受轻量 OS 沙箱限制工作区外写入。'
 
-  const parts: string[] = [basePrompt]
+  const parts: string[] = [basePrompt, `当前操作系统：${CLIENT_OS_NAME}。`]
 
   if (ctx.workspacePath) {
     parts.push(

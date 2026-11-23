@@ -1,4 +1,4 @@
-import { formatLatestReminderTag } from './latestReminder.js'
+import { formatLatestReminderTag, sanitizeLatestReminder } from './latestReminder.js'
 import type {
   AssistantBlockParam,
   FileBlockParam,
@@ -502,10 +502,12 @@ export const toRequestMessages = (
   const messages: MessageParam[] = []
   let previousReminder: string | undefined
   const consumeChangedReminder = (reminder: string | undefined): string | undefined => {
+    const normalized =
+      reminder && includeServerExtensions ? sanitizeLatestReminder(reminder) : reminder
     // 仅在当前分支首次出现或内容变化时插入快照，保留历史前缀的 Prompt Cache 命中率。
-    if (reminder && reminder !== previousReminder) {
-      previousReminder = reminder
-      return reminder
+    if (normalized && normalized !== previousReminder) {
+      previousReminder = normalized
+      return normalized
     }
     return undefined
   }
