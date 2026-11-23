@@ -136,6 +136,7 @@ export const zh = {
   deactivatedThinkTooltip: '先思考后回答，解决推理问题',
   thinkingSwitch: '深度思考',
   deactivatedSearchTooltip: '按需搜索网页',
+  searchUnavailableForModelTooltip: 'DeepSeek-V4-Pro 暂不支持智能搜索',
   search: '智能搜索',
   uploadFile: '上传文件',
   chatInputStopButtonTooltip: '停止生成',

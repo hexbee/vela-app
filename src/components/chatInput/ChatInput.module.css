@@ -442,12 +442,15 @@
   transition-property: border, background;
   transition-duration: 0.2s;
 
-  &:hover:not(:disabled) {
+  &:hover:not(:disabled):not(.disabled) {
     background-color: var(--dsw-alias-interactive-bg-hover);
   }
 
-  &:disabled {
+  &:disabled,
+  &.disabled {
     opacity: 0.4;
+    color: var(--dsw-alias-label-secondary);
+    background-color: transparent;
     cursor: not-allowed;
   }
 

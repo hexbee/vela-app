@@ -2,7 +2,12 @@ import { create } from 'zustand'
 import { ToolService, WorkspaceService } from '../../mygo.js'
 import { createId } from '../../utils/id.js'
 import { ApiError, streamMessage } from '../api/client.js'
-import type { CreateMessageRequest, ReasoningEffort } from '../api/types.js'
+import {
+  supportsServerExtensions,
+  type ChatModel,
+  type CreateMessageRequest,
+  type ReasoningEffort,
+} from '../api/types.js'
 import { extractFileIds, getFileErrorCode, isRetryableApiError } from '../api/errors.js'
 import { cancelUpload, describeUploadError, uploadAttachment, useUploads } from '../attachments.js'
 import { useSettings } from '../settings.js'
@@ -77,13 +82,18 @@ const FILE_RETRY_BASE_DELAY = 1000
 /** 单轮 Agent Loop 最大工具往返步数，防止死循环 */
 const MAX_AGENT_STEPS = 25
 
-/** 阅读链接始终开启，智能搜索开关控制是否另行声明搜索工具，同时挂载客户端内置文件工具与已连接的 MCP 工具。 */
-const requestTools = (search: boolean, sessionId: string): CreateMessageRequest['tools'] => {
-  const tools: CreateMessageRequest['tools'] = [
-    { type: 'deepseek_read_url', name: 'deepseek_read_url' },
-  ]
-  if (search) {
-    tools.push({ type: 'deepseek_web_search', name: 'deepseek_web_search' })
+/** 仅支持服务端扩展的模型声明阅读链接与智能搜索工具，所有模型均挂载客户端内置文件工具与已连接的 MCP 工具。 */
+const requestTools = (
+  model: ChatModel,
+  search: boolean,
+  sessionId: string
+): CreateMessageRequest['tools'] => {
+  const tools: CreateMessageRequest['tools'] = []
+  if (supportsServerExtensions(model)) {
+    tools.push({ type: 'deepseek_read_url', name: 'deepseek_read_url' })
+    if (search) {
+      tools.push({ type: 'deepseek_web_search', name: 'deepseek_web_search' })
+    }
   }
   tools.push(...CLIENT_FILE_TOOLS, ...getActiveMCPToolsForSession(sessionId))
   return tools
@@ -91,6 +101,36 @@ const requestTools = (search: boolean, sessionId: string): CreateMessageRequest[
 
 /** 允许自动补标题的请求；手动重命名后取消本轮标题写入，包含主动清空标题的情况。 */
 const titleRequests = new Set<AbortController>()
+
+const FLASH_TITLE_SYSTEM_PROMPT =
+  '请根据用户的第一条消息生成一个简短的对话标题（不超过 20 个字，与用户消息语言一致）。只输出标题文本本身，不要包含引号、书名号、前缀或任何解释。'
+
+/** 后台使用 deepseek-flash 生成标题的进行中请求，按 sessionId 索引以便重命名/删除时取消。 */
+const flashTitleControllers = new Map<string, AbortController>()
+
+const cancelFlashTitle = (sessionId: string) => {
+  const controller = flashTitleControllers.get(sessionId)
+  if (controller) {
+    flashTitleControllers.delete(sessionId)
+    controller.abort()
+  }
+}
+
+const cancelAllFlashTitles = () => {
+  for (const controller of flashTitleControllers.values()) {
+    controller.abort()
+  }
+  flashTitleControllers.clear()
+}
+
+const normalizeGeneratedTitle = (raw: string): string =>
+  raw
+    .replace(/\r?\n/g, ' ')
+    .trim()
+    .replace(/^(?:标题|title)\s*[:：]\s*/i, '')
+    .replace(/^[「『"“'‘《【]+|[」』"”'’》】]+$/g, '')
+    .trim()
+    .slice(0, 60)
 
 export type PendingApproval = {
   sessionId: string
@@ -373,7 +413,7 @@ export const bindChatPersistence = () => {
   }
 }
 
-/** 按当前开关创建回复：模型与推理等级从 settings 读取，智能搜索控制 deepseek_web_search。 */
+/** 按当前开关创建回复：模型与推理等级从 settings 读取，智能搜索仅在支持服务端扩展的模型下生效。 */
 const createReply = (): AssistantMessage => {
   const { model, reasoningEffort, search } = useSettings.getState()
   return {
@@ -383,7 +423,7 @@ const createReply = (): AssistantMessage => {
     model,
     thinking: reasoningEffort !== 'off',
     reasoningEffort,
-    search,
+    search: supportsServerExtensions(model) ? search : false,
     prefix: true,
     status: 'pending',
     blocks: [],
@@ -516,6 +556,7 @@ export const replaceHistory = async (write: () => Promise<void>): Promise<number
   }
   set({ importingHistory: true })
   try {
+    cancelAllFlashTitles()
     for (const controller of Object.values(get().streaming)) {
       controller.abort()
     }
@@ -675,6 +716,7 @@ export const renameSession = (id: string, title: string) => {
   if (get().importingHistory || deletingSessions.has(id)) {
     return
   }
+  cancelFlashTitle(id)
   const controller = getStreamController(id)
   if (controller) {
     titleRequests.delete(controller)
@@ -717,6 +759,7 @@ const removeSessionData = async (
   const hasScratch = Boolean(summary?.scratchDir || getSession(id)?.scratchDir)
   deletingSessions.add(id)
   try {
+    cancelFlashTitle(id)
     getStreamController(id)?.abort()
     // 等本会话的流收尾，避免删除之后又被收尾保存写回来。
     await waitForIdle(id)
@@ -982,16 +1025,17 @@ export const continueReply = (sessionId: string, messageId: string) => {
     return
   }
   const { model, reasoningEffort, search } = useSettings.getState()
+  const resolvedModel = previous.model ?? model
   const resolvedEffort: ReasoningEffort =
     previous.reasoningEffort ??
     (previous.thinking === undefined ? reasoningEffort : previous.thinking ? 'high' : 'off')
   const reply: AssistantMessage = {
     ...previous,
     // 未记录请求配置的回复，续写时使用当前所选模型和推理等级。
-    model: previous.model ?? model,
+    model: resolvedModel,
     thinking: resolvedEffort !== 'off',
     reasoningEffort: resolvedEffort,
-    search: previous.search ?? search,
+    search: supportsServerExtensions(resolvedModel) ? (previous.search ?? search) : false,
     status: 'pending',
     stopReason: undefined,
     stopDetails: undefined,
@@ -1256,6 +1300,81 @@ const getSessionWorkdir = (sessionId: string): string => {
   return ctx.workspacePath ?? ctx.scratchDir ?? ''
 }
 
+/** deepseek-v4-pro 不支持服务端标题生成，首轮内容开始后异步调用 deepseek-flash 补全会话标题。 */
+const generateTitleWithFlash = (sessionId: string, question: UserMessage) => {
+  if (flashTitleControllers.has(sessionId) || getSession(sessionId)?.title) {
+    return
+  }
+  const apiKey = useSettings.getState().apiKey ?? ''
+  if (!apiKey) {
+    return
+  }
+  const parts: string[] = []
+  if (question.content.trim()) {
+    parts.push(question.content.trim().slice(0, 1000))
+  }
+  if (question.files.length > 0) {
+    parts.push(`附件：${question.files.map((file) => file.name).join(', ')}`)
+  }
+  const promptText = parts.join('\n').trim()
+  if (!promptText) {
+    return
+  }
+  const epoch = historyEpoch
+  const titleController = new AbortController()
+  flashTitleControllers.set(sessionId, titleController)
+
+  void (async () => {
+    try {
+      const events = streamMessage(
+        apiKey,
+        {
+          model: 'deepseek-flash',
+          system: FLASH_TITLE_SYSTEM_PROMPT,
+          messages: [{ role: 'user', content: promptText }],
+          thinking: { type: 'disabled' },
+          safety_check: SAFETY_CHECK,
+          tools: [],
+        },
+        titleController.signal
+      )
+      let raw = ''
+      let refused = false
+      for await (const event of events) {
+        if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
+          raw += event.delta.text
+        } else if (event.type === 'message_delta' && event.delta.stop_reason === 'refusal') {
+          refused = true
+        }
+      }
+      if (refused) {
+        return
+      }
+      const title = normalizeGeneratedTitle(raw)
+      if (
+        !title ||
+        titleController.signal.aborted ||
+        epoch !== historyEpoch ||
+        deletingSessions.has(sessionId) ||
+        get().importingHistory ||
+        flashTitleControllers.get(sessionId) !== titleController
+      ) {
+        return
+      }
+      if (getSession(sessionId)) {
+        updateSession(sessionId, (session) => (session.title ? session : { ...session, title }))
+        persist(sessionId)
+      }
+    } catch {
+      // 标题生成失败不影响主对话
+    } finally {
+      if (flashTitleControllers.get(sessionId) === titleController) {
+        flashTitleControllers.delete(sessionId)
+      }
+    }
+  })()
+}
+
 const streamReply = async (sessionId: string, initial: AssistantMessage, request: Request) => {
   const controller = new AbortController()
   if (!getSession(sessionId)?.title) {
@@ -1279,6 +1398,8 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
       try {
         const prepared = await prepareFiles(sessionId, request, controller.signal)
         preparing = false
+        const model = initial.model ?? useSettings.getState().model
+        const serverExtensions = supportsServerExtensions(model)
         // 附件就绪后获取本轮信息；续写沿用原回答快照，重新生成的快照独立保存。
         const latestReminder = prepared.prefix
           ? prepared.prefix.latestReminder
@@ -1305,7 +1426,8 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
             step === 0 ? prepared.prefix : undefined,
             thinkingEnabled,
             latestReminder,
-            step > 0 ? reply : undefined
+            step > 0 ? reply : undefined,
+            serverExtensions
           )
           const agentCtx: AgentWorkspaceContext = {
             ...getSessionAgentContext(sessionId),
@@ -1317,14 +1439,16 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
           const events = streamMessage(
             useSettings.getState().apiKey ?? '',
             {
-              model: initial.model ?? useSettings.getState().model,
+              model,
               system: buildAgentSystemPrompt(SYSTEM_PROMPT, agentCtx),
               messages,
               thinking: { type: thinkingEnabled ? 'enabled' : 'disabled' },
               ...(thinkingEnabled ? { output_config: { effort } } : {}),
-              safety_check: SAFETY_CHECK,
-              tools: requestTools(initial.search ?? false, sessionId),
-              ...(titleRequests.has(controller) ? { title: { enabled: true } } : {}),
+              ...(serverExtensions ? { safety_check: SAFETY_CHECK } : {}),
+              tools: requestTools(model, initial.search ?? false, sessionId),
+              ...(serverExtensions && titleRequests.has(controller)
+                ? { title: { enabled: true } }
+                : {}),
             },
             controller.signal
           )
@@ -1332,6 +1456,10 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
           for await (const event of events) {
             if (event.type === 'content_block_start') {
               receivedContent = true
+              if (!serverExtensions && titleRequests.has(controller)) {
+                titleRequests.delete(controller)
+                generateTitleWithFlash(sessionId, prepared.question)
+              }
               if (pendingAckJobIds.length > 0) {
                 acknowledgeSettledJobNotices(sessionId, pendingAckJobIds)
                 pendingAckJobIds = []

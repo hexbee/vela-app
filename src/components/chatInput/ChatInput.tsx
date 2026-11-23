@@ -6,6 +6,7 @@ import {
   IconSendOutline16,
   IconStopFill16,
 } from '../base/icons.js'
+import { supportsServerExtensions } from '../../services/api/types.js'
 import { setSearch, useSettings } from '../../services/settings.js'
 import { useIsMobile } from '../../app/viewport.js'
 import { sendMessage, stopReply, useChatStore } from '../../services/chat/store.js'
@@ -99,7 +100,10 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
   )
   const importingHistory = useChatStore((state) => state.importingHistory)
   const isMobile = useIsMobile()
+  const model = useSettings((state) => state.model)
   const search = useSettings((state) => state.search)
+  const searchDisabled = !supportsServerExtensions(model)
+  const searchActive = !searchDisabled && search
   const fileInputRef = useRef<HTMLInputElement>(null)
   const editorRef = useRef<HTMLDivElement>(null)
   const togglesRef = useRef<HTMLDivElement>(null)
@@ -872,13 +876,26 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
             }}
           />
           <PermissionPicker sessionId={sessionId} disabled={importingHistory} />
-          <Tooltip content={t('deactivatedSearchTooltip')}>
+          <Tooltip
+            content={
+              searchDisabled ? t('searchUnavailableForModelTooltip') : t('deactivatedSearchTooltip')
+            }
+          >
             <button
               type="button"
-              className={clsx(styles.toggle, search && styles.selected)}
+              className={clsx(
+                styles.toggle,
+                searchActive && styles.selected,
+                searchDisabled && styles.disabled
+              )}
               aria-label={t('search')}
-              aria-pressed={search}
-              onClick={() => setSearch(!search)}
+              aria-pressed={searchActive}
+              aria-disabled={searchDisabled}
+              onClick={() => {
+                if (!searchDisabled) {
+                  setSearch(!search)
+                }
+              }}
             >
               <IconGlobeLanguageOutline14 />
               <span className={styles.toggleLabel}>{t('search')}</span>

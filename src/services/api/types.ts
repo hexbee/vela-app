@@ -6,6 +6,9 @@
 
 export type ChatModel = 'deepseek-flash' | 'deepseek-v4-pro'
 
+/** 仅 deepseek-flash 支持服务端工具（联网搜索、阅读链接）与服务端标题生成 */
+export const supportsServerExtensions = (model: ChatModel): boolean => model === 'deepseek-flash'
+
 /** DeepSeek 推理强度等级；off 表示关闭深度思考，low/high/max 开启思考并经 output_config.effort 下发 */
 export type ReasoningEffort = 'off' | 'low' | 'high' | 'max'
 
@@ -209,7 +212,7 @@ export type CreateMessageRequest = {
   thinking: { type: 'enabled' | 'disabled' }
   output_config?: { effort: Exclude<ReasoningEffort, 'off'> }
   tools: (DeepseekWebSearchTool | DeepseekReadUrlTool | ClientToolDefinition)[]
-  safety_check: { level: 'high' }
+  safety_check?: { level: 'high' }
   title?: { enabled: boolean }
 }
 

@@ -143,6 +143,7 @@ export const en = {
   deactivatedThinkTooltip: 'Think before responding to solve reasoning problems',
   thinkingSwitch: 'DeepThink',
   deactivatedSearchTooltip: 'Search the web when necessary',
+  searchUnavailableForModelTooltip: 'Search is unavailable for DeepSeek-V4-Pro',
   search: 'Search',
   uploadFile: 'Upload files',
   chatInputStopButtonTooltip: 'Stop',

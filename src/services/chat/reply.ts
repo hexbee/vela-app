@@ -1,3 +1,4 @@
+import { formatLatestReminderTag } from './latestReminder.js'
 import type {
   AssistantBlockParam,
   FileBlockParam,
@@ -309,15 +310,23 @@ const isUsableReply = (message: Message): message is AssistantMessage =>
   (getReplyText(message) !== '' ||
     message.blocks.some((block) => block.type === 'client_tool_result'))
 
-/** 有文件时用内容块数组：先文件后文本，文件按 Files API 的 file_id 引用 */
-const toUserParam = ({ content, files }: UserMessage): MessageParam => {
+/** 有文件或内联 reminder 时用内容块数组：先 reminder、再文件、后正文，文件按 Files API 的 file_id 引用 */
+const toUserParam = ({ content, files }: UserMessage, inlineReminder?: string): MessageParam => {
   const blocks = toFileBlocks(files)
-  return blocks.length === 0
-    ? { role: 'user', content }
-    : {
-        role: 'user',
-        content: [...blocks, ...(content ? [{ type: 'text' as const, text: content }] : [])],
-      }
+  const reminderBlocks: TextBlockParam[] = inlineReminder
+    ? [{ type: 'text', text: formatLatestReminderTag(inlineReminder) }]
+    : []
+  if (blocks.length === 0 && reminderBlocks.length === 0) {
+    return { role: 'user', content }
+  }
+  return {
+    role: 'user',
+    content: [
+      ...reminderBlocks,
+      ...blocks,
+      ...(content ? [{ type: 'text' as const, text: content }] : []),
+    ],
+  }
 }
 
 /**
@@ -331,7 +340,8 @@ const toUserParam = ({ content, files }: UserMessage): MessageParam => {
 const expandAssistantToMessages = (
   { blocks }: AssistantMessage,
   preserveThinking = false,
-  ensureTrailingAssistant = false
+  ensureTrailingAssistant = false,
+  includeServerExtensions = true
 ): MessageParam[] => {
   const resultIds = new Set<string>()
   for (const block of blocks) {
@@ -432,6 +442,7 @@ const expandAssistantToMessages = (
         })
       }
     } else if (
+      includeServerExtensions &&
       block.type === 'server_tool_use' &&
       block.kind === 'read_link' &&
       !unsignedReadLinks.has(block.id)
@@ -439,6 +450,7 @@ const expandAssistantToMessages = (
       const { type, id, name, input, kind } = block
       assistantContent.push({ type, id, name, input, kind })
     } else if (
+      includeServerExtensions &&
       block.type === 'web_fetch_tool_result' &&
       block.kind === 'read_link' &&
       !unsignedReadLinks.has(block.tool_use_id)
@@ -484,15 +496,28 @@ export const toRequestMessages = (
   prefix?: AssistantMessage,
   thinking = prefix?.thinking ?? false,
   latestReminder?: string,
-  inTurnReply?: AssistantMessage
+  inTurnReply?: AssistantMessage,
+  includeServerExtensions = true
 ): MessageParam[] => {
   const messages: MessageParam[] = []
   let previousReminder: string | undefined
-  const appendReminder = (reminder: string | undefined) => {
-    // 仅在当前分支首次出现或内容变化时插入快照；缺少快照的消息保持原有内容。
+  const consumeChangedReminder = (reminder: string | undefined): string | undefined => {
+    // 仅在当前分支首次出现或内容变化时插入快照，保留历史前缀的 Prompt Cache 命中率。
     if (reminder && reminder !== previousReminder) {
-      messages.push({ role: 'latest_reminder', content: reminder })
       previousReminder = reminder
+      return reminder
+    }
+    return undefined
+  }
+  const pushUserWithReminder = (user: UserMessage, reminder: string | undefined) => {
+    const changed = consumeChangedReminder(reminder)
+    if (includeServerExtensions) {
+      if (changed) {
+        messages.push({ role: 'latest_reminder', content: changed })
+      }
+      messages.push(toUserParam(user))
+    } else {
+      messages.push(toUserParam(user, changed))
     }
   }
   for (const [user, reply] of getContextRounds(history)) {
@@ -500,23 +525,24 @@ export const toRequestMessages = (
     if (!user.content && toFileBlocks(user.files).length === 0) {
       continue
     }
-    const expanded = expandAssistantToMessages(reply, false, true)
+    const expanded = expandAssistantToMessages(reply, false, true, includeServerExtensions)
     if (expanded.length === 0) {
       continue
     }
-    appendReminder(reply.latestReminder)
-    messages.push(toUserParam(user), ...expanded)
+    pushUserWithReminder(user, reply.latestReminder)
+    messages.push(...expanded)
   }
-  appendReminder(latestReminder)
-  messages.push(toUserParam(question))
+  pushUserWithReminder(question, latestReminder)
 
   if (inTurnReply) {
-    messages.push(...expandAssistantToMessages(inTurnReply, thinking, false))
+    messages.push(
+      ...expandAssistantToMessages(inTurnReply, thinking, false, includeServerExtensions)
+    )
     return messages
   }
 
   if (prefix?.prefix) {
-    const [assistant] = expandAssistantToMessages(prefix, thinking, false)
+    const [assistant] = expandAssistantToMessages(prefix, thinking, false, includeServerExtensions)
     // 没有非空白正文或有效思考时直接重发原问题，避免服务端拒绝空 Prefill。
     if (
       assistant?.role === 'assistant' &&
